@@ -1,0 +1,110 @@
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
+
+const MAX_AUDIO_BYTES = Number(process.env.YTDLP_MAX_AUDIO_BYTES || 50 * 1024 * 1024);
+const MAX_VIDEO_BYTES = Number(process.env.YTDLP_MAX_VIDEO_BYTES || 64 * 1024 * 1024);
+
+function validateYouTubeUrl(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error('Invalid YouTube URL'); }
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '').replace(/^m\./, '');
+  if (!['youtube.com', 'youtu.be', 'music.youtube.com'].includes(host) && !host.endsWith('.youtube.com')) {
+    throw new Error('Only YouTube URLs are supported by the yt-dlp fallback');
+  }
+  return parsed.toString();
+}
+
+async function download(url, mode) {
+  const safeUrl = validateYouTubeUrl(url);
+  const maxBytes = mode === 'audio' ? MAX_AUDIO_BYTES : MAX_VIDEO_BYTES;
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'knightbot-yt-'));
+  const output = path.join(tempDir, 'media.%(ext)s');
+  const args = [
+    '--no-playlist', '--no-warnings', '--no-progress', '--restrict-filenames',
+    '--max-filesize', String(maxBytes), '-o', output,
+    '-f', mode === 'audio' ? 'bestaudio/best' : 'best[ext=mp4][height<=720]/best[height<=720]/best',
+    safeUrl
+  ];
+  try {
+    await execFileAsync(process.env.YTDLP_BIN || 'yt-dlp', args, {
+      timeout: Number(process.env.YTDLP_TIMEOUT_MS || 180000),
+      maxBuffer: 2 * 1024 * 1024,
+      windowsHide: true
+    });
+    const files = (await fs.promises.readdir(tempDir)).filter(name => name.startsWith('media.'));
+    if (!files.length) throw new Error('yt-dlp completed without producing a media file');
+    const filePath = path.join(tempDir, files[0]);
+    const stat = await fs.promises.stat(filePath);
+    if (!stat.size || stat.size > maxBytes) throw new Error(`Downloaded media size is invalid (${stat.size} bytes)`);
+    const buffer = await fs.promises.readFile(filePath);
+    return { buffer, extension: path.extname(filePath).slice(1).toLowerCase(), size: stat.size };
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      throw new Error('yt-dlp is not installed or not available in PATH. Install yt-dlp on the VPS/PC, then retry.');
+    }
+    throw new Error(`yt-dlp ${mode} fallback failed: ${error.stderr?.trim() || error.message}`);
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+
+const SOCIAL_HOSTS = new Set([
+  'youtube.com', 'youtu.be', 'music.youtube.com',
+  'tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com',
+  'instagram.com', 'facebook.com', 'fb.com', 'fb.watch',
+  'x.com', 'twitter.com', 'pinterest.com', 'pin.it'
+]);
+
+function validatePublicMediaUrl(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error('Invalid media URL'); }
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '').replace(/^m\./, '');
+  const allowed = [...SOCIAL_HOSTS].some(domain => host === domain || host.endsWith(`.${domain}`));
+  if (!allowed) throw new Error('This media host is not supported by the yt-dlp fallback');
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP(S) media URLs are supported');
+  return parsed.toString();
+}
+
+async function downloadPublicMedia(url) {
+  const safeUrl = validatePublicMediaUrl(url);
+  const maxBytes = Number(process.env.YTDLP_MAX_SOCIAL_BYTES || 64 * 1024 * 1024);
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'knightbot-social-'));
+  const output = path.join(tempDir, 'media.%(ext)s');
+  try {
+    await execFileAsync(process.env.YTDLP_BIN || 'yt-dlp', [
+      '--no-playlist', '--no-warnings', '--no-progress', '--restrict-filenames',
+      '--max-filesize', String(maxBytes), '-o', output,
+      '-f', 'best[ext=mp4][height<=720]/best[height<=720]/best', safeUrl
+    ], {
+      timeout: Number(process.env.YTDLP_TIMEOUT_MS || 180000),
+      maxBuffer: 2 * 1024 * 1024,
+      windowsHide: true
+    });
+    const files = (await fs.promises.readdir(tempDir)).filter(name => name.startsWith('media.'));
+    if (!files.length) throw new Error('yt-dlp produced no media file');
+    const filePath = path.join(tempDir, files[0]);
+    const stat = await fs.promises.stat(filePath);
+    if (!stat.size || stat.size > maxBytes) throw new Error(`Media size is invalid (${stat.size} bytes)`);
+    return { buffer: await fs.promises.readFile(filePath), extension: path.extname(filePath).slice(1).toLowerCase(), size: stat.size };
+  } catch (error) {
+    if (error.code === 'ENOENT') throw new Error('yt-dlp is not installed or not available in PATH');
+    throw new Error(`yt-dlp fallback failed: ${error.stderr?.trim() || error.message}`);
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+module.exports = {
+  downloadPublicMedia,
+  validatePublicMediaUrl,
+  downloadYouTubeAudio: url => download(url, 'audio'),
+  downloadYouTubeVideo: url => download(url, 'video'),
+  validateYouTubeUrl
+};
