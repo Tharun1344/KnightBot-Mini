@@ -1,13 +1,19 @@
+
 require('dotenv').config({ override: false });
+
 /**
- * WhatsApp MD Bot - Main Entry Point
+ * KnightBot-Mini WhatsApp MD Bot
+ * Main entry point
  */
+
 process.env.PUPPETEER_SKIP_DOWNLOAD = 'true';
 process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 'true';
-process.env.PUPPETEER_CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer_cache_disabled';
+process.env.PUPPETEER_CACHE_DIR =
+  process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer_cache_disabled';
 
 const { initializeTempSystem } = require('./utils/tempManager');
 const { startCleanup } = require('./utils/cleanup');
+
 initializeTempSystem();
 startCleanup();
 
@@ -32,62 +38,59 @@ const forbiddenPatternsConsole = [
   'basekey'
 ];
 
-console.log = (...args) => {
-  const message = args.map(a =>
-    typeof a === 'string'
-      ? a
-      : typeof a === 'object'
-        ? JSON.stringify(a)
-        : String(a)
-  ).join(' ').toLowerCase();
+function shouldSuppressConsole(args, patterns) {
+  const message = args
+    .map(value => {
+      if (typeof value === 'string') return value;
 
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
+      if (value && typeof value === 'object') {
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return '[unserializable object]';
+        }
+      }
+
+      return String(value);
+    })
+    .join(' ')
+    .toLowerCase();
+
+  return patterns.some(pattern => message.includes(pattern));
+}
+
+console.log = (...args) => {
+  if (!shouldSuppressConsole(args, forbiddenPatternsConsole)) {
     originalConsoleLog.apply(console, args);
   }
 };
 
 console.error = (...args) => {
-  const message = args.map(a =>
-    typeof a === 'string'
-      ? a
-      : typeof a === 'object'
-        ? JSON.stringify(a)
-        : String(a)
-  ).join(' ').toLowerCase();
-
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
+  if (!shouldSuppressConsole(args, forbiddenPatternsConsole)) {
     originalConsoleError.apply(console, args);
   }
 };
 
 console.warn = (...args) => {
-  const message = args.map(a =>
-    typeof a === 'string'
-      ? a
-      : typeof a === 'object'
-        ? JSON.stringify(a)
-        : String(a)
-  ).join(' ').toLowerCase();
-
-  if (!forbiddenPatternsConsole.some(pattern => message.includes(pattern))) {
+  if (!shouldSuppressConsole(args, forbiddenPatternsConsole)) {
     originalConsoleWarn.apply(console, args);
   }
 };
 
-// Now safe to load libraries
 const pino = require('pino');
 
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  Browsers,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  downloadMediaMessage
 } = require('@whiskeysockets/baileys');
 
 const qrcode = require('qrcode-terminal');
 const config = require('./config');
 const handler = require('./handler');
+
 const {
   getRevokeInfo,
   notifyDeletedMessage
@@ -98,80 +101,92 @@ const path = require('path');
 const zlib = require('zlib');
 const os = require('os');
 const { spawn } = require('child_process');
-const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 
-// Remove Puppeteer cache
+/*
+ * Remove Puppeteer cache when present.
+ */
 function cleanupPuppeteerCache() {
   try {
-    const home = os.homedir();
-    const cacheDir = path.join(home, '.cache', 'puppeteer');
+    const cacheDir = path.join(
+      os.homedir(),
+      '.cache',
+      'puppeteer'
+    );
 
     if (fs.existsSync(cacheDir)) {
-      console.log('Removing Puppeteer cache at:', cacheDir);
-      fs.rmSync(cacheDir, { recursive: true, force: true });
-      console.log('Puppeteer cache removed');
+      console.log('Removing Puppeteer cache:', cacheDir);
+
+      fs.rmSync(cacheDir, {
+        recursive: true,
+        force: true
+      });
+
+      console.log('Puppeteer cache removed.');
     }
-  } catch (err) {
-    console.error('Failed to cleanup Puppeteer cache:', err.message || err);
+  } catch (error) {
+    console.error(
+      'Failed to clean Puppeteer cache:',
+      error?.message || error
+    );
   }
 }
 
-// Optimized in-memory store
+/*
+ * In-memory message store.
+ */
 const store = {
   messages: new Map(),
   maxPerChat: 200,
 
-  bind: (ev) => {
-    ev.on('messages.upsert', ({ messages }) => {
+  bind(ev) {
+    ev.on('messages.upsert', ({ messages = [] }) => {
       for (const msg of messages) {
-        if (!msg.key?.id || getRevokeInfo(msg)) continue;
+        if (!msg?.key?.id || getRevokeInfo(msg)) continue;
 
         const jid = msg.key.remoteJid;
+        if (!jid) continue;
 
         if (!store.messages.has(jid)) {
           store.messages.set(jid, new Map());
         }
 
-        const chatMsgs = store.messages.get(jid);
-        chatMsgs.set(msg.key.id, msg);
+        const chatMessages = store.messages.get(jid);
 
-        if (chatMsgs.size > store.maxPerChat) {
-          const oldestKey = chatMsgs.keys().next().value;
-          chatMsgs.delete(oldestKey);
+        chatMessages.set(msg.key.id, msg);
+
+        while (chatMessages.size > store.maxPerChat) {
+          const oldestKey = chatMessages.keys().next().value;
+
+          if (oldestKey === undefined) break;
+
+          chatMessages.delete(oldestKey);
         }
       }
     });
   },
 
-  loadMessage: async (jid, id) => {
+  async loadMessage(jid, id) {
     return store.messages.get(jid)?.get(id) || null;
   }
 };
 
-// Message deduplication
+/*
+ * Message deduplication.
+ */
 const processedMessages = new Set();
 
-setInterval(() => {
+const processedMessagesCleanup = setInterval(() => {
   processedMessages.clear();
 }, 5 * 60 * 1000);
 
-// Custom Pino logger with suppression
-const createSuppressedLogger = (level = 'silent') => {
+processedMessagesCleanup.unref?.();
+
+/*
+ * Suppressed Pino logger.
+ */
+function createSuppressedLogger(level = 'silent') {
   const forbiddenPatterns = [
-    'closing session',
-    'closing open session',
-    'sessionentry',
-    'prekey bundle',
-    'pendingprekey',
-    '_chains',
-    'registrationid',
-    'currentratchet',
-    'chainkey',
-    'ratchet',
-    'signal protocol',
-    'ephemeralkeypair',
-    'indexinfo',
-    'basekey',
+    ...forbiddenPatternsConsole,
     'ratchetkey'
   ];
 
@@ -180,23 +195,18 @@ const createSuppressedLogger = (level = 'silent') => {
   try {
     logger = pino({
       level,
-      transport: process.env.NODE_ENV === 'production'
-        ? undefined
-        : {
-            target: 'pino-pretty',
-            options: {
-              colorize: true,
-              ignore: 'pid,hostname'
-            }
-          },
-      customLevels: {
-        trace: 0,
-        debug: 1,
-        info: 2,
-        warn: 3,
-        error: 4,
-        fatal: 5
-      },
+
+      transport:
+        process.env.NODE_ENV === 'production'
+          ? undefined
+          : {
+              target: 'pino-pretty',
+              options: {
+                colorize: true,
+                ignore: 'pid,hostname'
+              }
+            },
+
       redact: [
         'registrationId',
         'ephemeralKeyPair',
@@ -205,18 +215,14 @@ const createSuppressedLogger = (level = 'silent') => {
         'baseKey'
       ]
     });
-  } catch (err) {
+  } catch {
     logger = pino({ level });
   }
 
   const originalInfo = logger.info.bind(logger);
 
   logger.info = (...args) => {
-    const msg = args.map(a =>
-      typeof a === 'string' ? a : JSON.stringify(a)
-    ).join(' ').toLowerCase();
-
-    if (!forbiddenPatterns.some(pattern => msg.includes(pattern))) {
+    if (!shouldSuppressConsole(args, forbiddenPatterns)) {
       originalInfo(...args);
     }
   };
@@ -225,38 +231,119 @@ const createSuppressedLogger = (level = 'silent') => {
   logger.trace = () => {};
 
   return logger;
-};
+}
 
-// Main connection function
+/*
+ * Pairing number configuration.
+ *
+ * Set this in the hosting panel:
+ * PAIRING_NUMBER=947XXXXXXXX
+ *
+ * Use the complete international number:
+ * - Include the country code.
+ * - Do not include a plus sign.
+ * - Do not include spaces or hyphens.
+ *
+ * If the existing session is already registered,
+ * the saved session will be reused.
+ */
+function getPairingConfiguration(state) {
+  const raw = String(
+    process.env.PAIRING_NUMBER || ''
+  ).trim();
+
+  const number = raw.replace(/\D/g, '');
+
+  const valid = /^\d{8,15}$/.test(number);
+
+  const mode =
+    Boolean(raw) &&
+    valid &&
+    !state.creds.registered;
+
+  if (raw && !valid) {
+    console.error(
+      '[PAIRING] Invalid PAIRING_NUMBER. Use the full international number with digits only.'
+    );
+  }
+
+  if (raw && valid && state.creds.registered) {
+    console.log(
+      '[PAIRING] An existing registered session was found. Reusing saved credentials.'
+    );
+  }
+
+  if (!raw && !state.creds.registered) {
+    console.log(
+      '[PAIRING] PAIRING_NUMBER is not configured. QR login will be used.'
+    );
+  }
+
+  return {
+    number,
+    mode
+  };
+}
+
+/*
+ * Main WhatsApp connection.
+ */
 async function startBot() {
-  const sessionFolder = path.join(__dirname, config.sessionName);
-  const sessionFile = path.join(sessionFolder, 'creds.json');
+  const sessionFolder = path.join(
+    __dirname,
+    config.sessionName
+  );
 
-  // Check if sessionID is provided
-  if (config.sessionID && config.sessionID.startsWith('KnightBot!')) {
+  const sessionFile = path.join(
+    sessionFolder,
+    'creds.json'
+  );
+
+  /*
+   * Import a supplied KnightBot session, if configured.
+   */
+  if (
+    config.sessionID &&
+    config.sessionID.startsWith('KnightBot!')
+  ) {
     try {
-      const [header, b64data] = config.sessionID.split('!');
+      const [header, base64Data] =
+        config.sessionID.split('!');
 
-      if (header !== 'KnightBot' || !b64data) {
+      if (header !== 'KnightBot' || !base64Data) {
         throw new Error(
-          "Invalid session format. Expected 'KnightBot!.....'"
+          "Invalid session format. Expected 'KnightBot!.....'."
         );
       }
 
-      const cleanB64 = b64data.replace('...', '');
-      const compressedData = Buffer.from(cleanB64, 'base64');
-      const decompressedData = zlib.gunzipSync(compressedData);
+      const cleanBase64 = base64Data.replace('...', '');
 
-      if (!fs.existsSync(sessionFolder)) {
-        fs.mkdirSync(sessionFolder, { recursive: true });
-      }
+      const compressedData = Buffer.from(
+        cleanBase64,
+        'base64'
+      );
 
-      fs.writeFileSync(sessionFile, decompressedData, 'utf8');
-      console.log('Session retrieved from KnightBot Session');
-    } catch (e) {
+      const decompressedData = zlib.gunzipSync(
+        compressedData
+      );
+
+      fs.mkdirSync(sessionFolder, {
+        recursive: true
+      });
+
+      fs.writeFileSync(
+        sessionFile,
+        decompressedData,
+        'utf8'
+      );
+
+      console.log(
+        'Session retrieved from KnightBot Session.'
+      );
+    } catch (error) {
       console.error(
         'Error processing KnightBot session:',
-        e.message
+        error?.message || error
       );
     }
   }
@@ -264,119 +351,56 @@ async function startBot() {
   const { state, saveCreds } =
     await useMultiFileAuthState(sessionFolder);
 
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } =
+    await fetchLatestBaileysVersion();
 
-  const suppressedLogger = createSuppressedLogger('silent');
+  const logger = createSuppressedLogger('silent');
 
-  /*
-   * PAIRING CODE CONFIGURATION
-   *
-   * Set PAIRING_NUMBER in your hosting environment.
-   * Example Sri Lankan number: 9477XXXXXXX
-   *
-   * Use country code + number, digits only.
-   * Do not include +, spaces, or hyphens.
-   *
-   * If PAIRING_NUMBER is missing or invalid, QR login remains available.
-   */
-
-  const pairingNumberRaw =
-    String(process.env.PAIRING_NUMBER || '').trim();
-
-  const pairingNumber =
-    pairingNumberRaw.replace(/\D/g, '');
-
-  const pairingNumberValid =
-    /^\d{8,15}$/.test(pairingNumber);
-
-  const pairingMode =
-    pairingNumberRaw.length > 0 &&
-    pairingNumberValid &&
-    !state.creds.registered;
-
-  if (pairingNumberRaw && !pairingNumberValid) {
-    console.error(
-      '[PAIRING] PAIRING_NUMBER is invalid. Use international format, digits only. Example: 9477XXXXXXX'
-    );
-    console.error(
-      '[PAIRING] QR login will remain enabled until you correct PAIRING_NUMBER.'
-    );
-  }
-
-  if (
-    pairingNumberRaw &&
-    pairingNumberValid &&
-    state.creds.registered
-  ) {
-    console.log(
-      '[PAIRING] Existing registered session found. Reusing saved session.'
-    );
-  }
+  const {
+    number: pairingNumber,
+    mode: pairingMode
+  } = getPairingConfiguration(state);
 
   const sock = makeWASocket({
     version,
-    logger: suppressedLogger,
+    logger,
+
     printQRInTerminal: false,
-    browser: ['Chrome', 'Windows', '10.0'],
+
+    browser: [
+      'Chrome',
+      'Windows',
+      '10.0'
+    ],
+
     auth: state,
+
     syncFullHistory: false,
     downloadHistory: false,
     markOnlineOnConnect: false,
+
     getMessage: async () => undefined
   });
 
   /*
-   * Request the pairing code once per socket startup.
-   * The delay gives the socket time to initialize.
+   * Pairing-code fix:
+   *
+   * Do not use an arbitrary setTimeout to request a code.
+   * Wait for Baileys to emit its QR/registration event,
+   * then request a code only once for this socket.
    */
-  if (pairingMode) {
-    let pairingCodeRequested = false;
+  let pairingCodeRequested = false;
 
-    setTimeout(async () => {
-      if (pairingCodeRequested) return;
-
-      pairingCodeRequested = true;
-
-      try {
-        if (typeof sock.requestPairingCode !== 'function') {
-          throw new Error(
-            'This Baileys version does not expose requestPairingCode(). Check the installed @whiskeysockets/baileys version.'
-          );
-        }
-
-        const code =
-          await sock.requestPairingCode(pairingNumber);
-
-        console.log('\n========================================');
-        console.log(' WhatsApp PHONE-NUMBER PAIRING CODE');
-        console.log('========================================');
-        console.log(`\n  ${code}\n`);
-        console.log('On your phone:');
-        console.log('1. Open WhatsApp.');
-        console.log('2. Go to Linked devices.');
-        console.log('3. Select Link a device.');
-        console.log('4. Select Link with phone number instead.');
-        console.log('5. Enter the code shown above.');
-        console.log('\nDo not share this code with anyone.');
-        console.log('========================================\n');
-      } catch (err) {
-        console.error(
-          '[PAIRING] Could not request pairing code:',
-          err?.message || err
-        );
-
-        console.error(
-          '[PAIRING] Check PAIRING_NUMBER, the installed Baileys version, and whether this account can link another device.'
-        );
-      }
-    }, 1500);
-  }
-
-  // Bind store to socket
+  /*
+   * Store messages.
+   */
   store.bind(sock.ev);
 
-  // Watchdog for inactive socket
+  /*
+   * Socket inactivity watchdog.
+   */
   let lastActivity = Date.now();
+
   const INACTIVITY_TIMEOUT = 30 * 60 * 1000;
 
   sock.ev.on('messages.upsert', () => {
@@ -384,125 +408,292 @@ async function startBot() {
   });
 
   const watchdogInterval = setInterval(async () => {
-    if (
-      Date.now() - lastActivity > INACTIVITY_TIMEOUT &&
-      sock.ws.readyState === 1
-    ) {
-      console.log(
-        'No activity detected. Forcing reconnect...'
+    try {
+      if (
+        Date.now() - lastActivity > INACTIVITY_TIMEOUT &&
+        sock.ws?.readyState === 1
+      ) {
+        console.log(
+          'No activity detected. Reconnecting socket...'
+        );
+
+        clearInterval(watchdogInterval);
+
+        await sock.end(undefined, undefined, {
+          reason: 'inactive'
+        });
+
+        setTimeout(() => {
+          startBot().catch(error => {
+            console.error(
+              '[WATCHDOG] Restart failed:',
+              error?.message || error
+            );
+          });
+        }, 5000);
+      }
+    } catch (error) {
+      console.error(
+        '[WATCHDOG] Error:',
+        error?.message || error
       );
-
-      await sock.end(undefined, undefined, {
-        reason: 'inactive'
-      });
-
-      clearInterval(watchdogInterval);
-
-      setTimeout(() => startBot(), 5000);
     }
   }, 5 * 60 * 1000);
 
-  sock.ev.on('connection.update', (update) => {
+  watchdogInterval.unref?.();
+
+  sock.ev.on('connection.update', update => {
     const { connection } = update;
 
     if (connection === 'open') {
       lastActivity = Date.now();
-    } else if (connection === 'close') {
+    }
+
+    if (connection === 'close') {
       clearInterval(watchdogInterval);
     }
   });
 
-  // Connection update handler
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  /*
+   * Connection updates and login.
+   */
+  sock.ev.on(
+    'connection.update',
+    async update => {
+      const {
+        connection,
+        lastDisconnect,
+        qr
+      } = update;
 
-    // QR mode only: do not print QR when pairing mode is enabled.
-    if (qr && !pairingMode) {
-      console.log('\n\nScan this QR code with WhatsApp:\n');
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !==
-        DisconnectReason.loggedOut;
-
-      const statusCode =
-        lastDisconnect?.error?.output?.statusCode;
-
-      const errorMessage =
-        lastDisconnect?.error?.message || 'Unknown error';
-
+      /*
+       * Pairing-code login.
+       */
       if (
-        statusCode === 515 ||
-        statusCode === 503 ||
-        statusCode === 408
+        qr &&
+        pairingMode &&
+        !pairingCodeRequested
       ) {
+        pairingCodeRequested = true;
+
+        try {
+          if (
+            typeof sock.requestPairingCode !== 'function'
+          ) {
+            throw new Error(
+              'requestPairingCode() is unavailable in the installed Baileys version.'
+            );
+          }
+
+          const code =
+            await sock.requestPairingCode(
+              pairingNumber
+            );
+
+          console.log(
+            '\n========================================'
+          );
+          console.log(
+            ' WHATSAPP PHONE-NUMBER PAIRING CODE'
+          );
+          console.log(
+            '========================================'
+          );
+
+          console.log(`\n  ${code}\n`);
+
+          console.log('On your phone:');
+          console.log('1. Open WhatsApp.');
+          console.log('2. Open Linked devices.');
+          console.log('3. Tap Link a device.');
+          console.log(
+            '4. Choose Link with phone number instead.'
+          );
+          console.log(
+            '5. Enter the newly generated code promptly.'
+          );
+
+          console.log(
+            '\nDo not share this code with anyone.'
+          );
+
+          console.log(
+            '========================================\n'
+          );
+        } catch (error) {
+          /*
+           * Permit a later QR update to retry if the
+           * initial pairing-code request fails.
+           */
+          pairingCodeRequested = false;
+
+          console.error(
+            '[PAIRING] Failed to request pairing code:',
+            error?.message || error
+          );
+
+          console.error(
+            '[PAIRING] Check PAIRING_NUMBER, your saved session, and the installed Baileys version.'
+          );
+        }
+      } else if (qr && !pairingMode) {
+        /*
+         * Standard QR login remains available when
+         * pairing mode is not enabled.
+         */
         console.log(
-          `Connection closed (${statusCode}). Reconnecting...`
+          '\n\nScan this QR code with WhatsApp:\n'
         );
-      } else {
-        console.log(
-          'Connection closed due to:',
-          errorMessage,
-          '\nReconnecting:',
-          shouldReconnect
-        );
+
+        qrcode.generate(qr, {
+          small: true
+        });
       }
 
-      if (shouldReconnect) {
-        setTimeout(() => startBot(), 3000);
-      }
-    } else if (connection === 'open') {
-      console.log('\nBot connected successfully!');
-      console.log(
-        `Bot Number: ${sock.user.id.split(':')[0]}`
-      );
-      console.log(`Bot Name: ${config.botName}`);
-      console.log(`Prefix: ${config.prefix}`);
+      /*
+       * Handle connection closures.
+       */
+      if (connection === 'close') {
+        const statusCode =
+          lastDisconnect?.error?.output?.statusCode;
 
-      const ownerNames = Array.isArray(config.ownerName)
-        ? config.ownerName.join(',')
-        : config.ownerName;
+        const errorMessage =
+          lastDisconnect?.error?.message ||
+          'Unknown error';
 
-      console.log(`Owner: ${ownerNames}\n`);
-      console.log('Bot is ready to receive messages!\n');
-
-      if (config.autoBio) {
-        await sock.updateProfileStatus(
-          `${config.botName} | Active 24/7`
-        );
-      }
-
-      handler.initializeAntiCall(sock);
-
-      // Clean up old chats
-      const now = Date.now();
-
-      for (const [jid, chatMsgs] of store.messages.entries()) {
-        const timestamps = Array.from(
-          chatMsgs.values()
-        ).map(m => m.messageTimestamp * 1000 || 0);
+        const shouldReconnect =
+          statusCode !== DisconnectReason.loggedOut;
 
         if (
-          timestamps.length > 0 &&
-          now - Math.max(...timestamps) > 24 * 60 * 60 * 1000
+          statusCode === 515 ||
+          statusCode === 503 ||
+          statusCode === 408
         ) {
-          store.messages.delete(jid);
+          console.log(
+            `Connection closed (${statusCode}).`
+          );
+        } else {
+          console.log(
+            'Connection closed:',
+            errorMessage
+          );
         }
+
+        if (shouldReconnect) {
+          setTimeout(() => {
+            startBot().catch(error => {
+              console.error(
+                '[RECONNECT] Restart failed:',
+                error?.message || error
+              );
+            });
+          }, 3000);
+        } else {
+          console.error(
+            '[AUTH] WhatsApp logged out. Remove the old session only if you intend to pair again.'
+          );
+        }
+
+        return;
       }
 
-      console.log(
-        `Store cleaned. Active chats: ${store.messages.size}`
-      );
-    }
-  });
+      /*
+       * Successful connection.
+       */
+      if (connection === 'open') {
+        lastActivity = Date.now();
 
-  // Credentials update handler
+        console.log(
+          '\nBot connected successfully!'
+        );
+
+        console.log(
+          `Bot Number: ${sock.user?.id?.split(':')[0] || 'Unknown'}`
+        );
+
+        console.log(
+          `Bot Name: ${config.botName}`
+        );
+
+        console.log(
+          `Prefix: ${config.prefix}`
+        );
+
+        const ownerNames =
+          Array.isArray(config.ownerName)
+            ? config.ownerName.join(',')
+            : config.ownerName;
+
+        console.log(
+          `Owner: ${ownerNames}\n`
+        );
+
+        console.log(
+          'Bot is ready to receive messages!\n'
+        );
+
+        if (config.autoBio) {
+          try {
+            await sock.updateProfileStatus(
+              `${config.botName} | Active 24/7`
+            );
+          } catch (error) {
+            console.error(
+              '[PROFILE] Could not update status:',
+              error?.message || error
+            );
+          }
+        }
+
+        try {
+          handler.initializeAntiCall(sock);
+        } catch (error) {
+          console.error(
+            '[ANTICALL] Initialization failed:',
+            error?.message || error
+          );
+        }
+
+        /*
+         * Clean old stored chats.
+         */
+        const now = Date.now();
+
+        for (
+          const [jid, chatMessages]
+          of store.messages.entries()
+        ) {
+          const timestamps = Array.from(
+            chatMessages.values()
+          ).map(message =>
+            Number(message.messageTimestamp || 0) * 1000
+          );
+
+          if (
+            timestamps.length > 0 &&
+            now - Math.max(...timestamps) >
+              24 * 60 * 60 * 1000
+          ) {
+            store.messages.delete(jid);
+          }
+        }
+
+        console.log(
+          `Store cleaned. Active chats: ${store.messages.size}`
+        );
+      }
+    }
+  );
+
+  /*
+   * Save updated WhatsApp credentials.
+   */
   sock.ev.on('creds.update', saveCreds);
 
-  // System JID filter
-  const isSystemJid = (jid) => {
+  /*
+   * Ignore system/broadcast JIDs.
+   */
+  function isSystemJid(jid) {
     if (!jid) return true;
 
     return (
@@ -511,211 +702,284 @@ async function startBot() {
       jid.includes('@newsletter') ||
       jid.includes('@newsletter.')
     );
-  };
+  }
 
-  // Messages handler
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return;
+  /*
+   * Incoming message handler.
+   */
+  sock.ev.on(
+    'messages.upsert',
+    ({ messages = [], type }) => {
+      if (type !== 'notify') return;
 
-    for (const msg of messages || []) {
-      if (getRevokeInfo(msg)) {
-        void notifyDeletedMessage(sock, msg, {
-          store,
-          config,
-          getGroupMetadata: handler.getGroupMetadata
-        });
-
-        continue;
-      }
-
-      if (!msg.message || !msg.key?.id) continue;
-
-      const from = msg.key.remoteJid;
-
-      if (!from) continue;
-
-      if (isSystemJid(from)) continue;
-
-      // Optional photo-only archive
-      if (
-        config.photoArchive?.enabled &&
-        !msg.key.fromMe &&
-        msg.message?.imageMessage
-      ) {
-        const image = msg.message.imageMessage;
-        const size = Number(image.fileLength || 0);
-
-        const owner = Array.isArray(config.ownerNumber)
-          ? config.ownerNumber[0]
-          : config.ownerNumber;
-
-        const ownerJid = owner
-          ? (
-              String(owner).includes('@')
-                ? String(owner)
-                : `${String(owner).replace(/\D/g, '')}@s.whatsapp.net`
-            )
-          : '';
-
-        if (
-          ownerJid &&
-          (!size ||
-            size <= Number(config.photoArchive.maxBytes || 8388608))
-        ) {
-          setImmediate(async () => {
-            try {
-              const buffer = await downloadMediaMessage(
-                msg,
-                'buffer',
-                {},
-                { logger: suppressedLogger }
-              );
-
-              if (
-                Buffer.isBuffer(buffer) &&
-                buffer.length <= Number(
-                  config.photoArchive.maxBytes || 8388608
-                )
-              ) {
-                await sock.sendMessage(ownerJid, {
-                  image: buffer,
-                  caption:
-                    `Photo archive\n` +
-                    `From: ${from}\n` +
-                    `Sender: ${msg.key.participant || msg.key.remoteJid}\n` +
-                    `Time: ${new Date().toISOString()}`
-                });
-              }
-            } catch (archiveError) {
-              console.error(
-                '[photo-archive] Failed:',
-                archiveError?.message || archiveError
-              );
-            }
+      for (const msg of messages) {
+        /*
+         * Deleted-message auditing.
+         */
+        if (getRevokeInfo(msg)) {
+          void notifyDeletedMessage(sock, msg, {
+            store,
+            config,
+            getGroupMetadata: handler.getGroupMetadata
           });
+
+          continue;
         }
-      }
 
-      // Deduplication
-      const msgId = msg.key.id;
+        if (!msg.message || !msg.key?.id) {
+          continue;
+        }
 
-      if (processedMessages.has(msgId)) continue;
+        const from = msg.key.remoteJid;
 
-      // Timestamp validation
-      const MESSAGE_AGE_LIMIT = 5 * 60 * 1000;
-      let messageAge = 0;
+        if (!from || isSystemJid(from)) {
+          continue;
+        }
 
-      if (msg.messageTimestamp) {
-        messageAge =
-          Date.now() - msg.messageTimestamp * 1000;
+        /*
+         * Optional photo-only archive.
+         * This forwards images only, not all message types.
+         */
+        if (
+          config.photoArchive?.enabled &&
+          !msg.key.fromMe &&
+          msg.message?.imageMessage
+        ) {
+          const image = msg.message.imageMessage;
 
-        if (messageAge > MESSAGE_AGE_LIMIT) continue;
-      }
+          const declaredSize = Number(
+            image.fileLength || 0
+          );
 
-      processedMessages.add(msgId);
+          const owner = Array.isArray(config.ownerNumber)
+            ? config.ownerNumber[0]
+            : config.ownerNumber;
 
-      // Store message before processing
-      if (msg.key && msg.key.id) {
+          const ownerJid = owner
+            ? (
+                String(owner).includes('@')
+                  ? String(owner)
+                  : `${String(owner).replace(/\D/g, '')}@s.whatsapp.net`
+              )
+            : '';
+
+          const maxBytes = Number(
+            config.photoArchive.maxBytes || 8388608
+          );
+
+          if (
+            ownerJid &&
+            (!declaredSize || declaredSize <= maxBytes)
+          ) {
+            setImmediate(async () => {
+              try {
+                const buffer =
+                  await downloadMediaMessage(
+                    msg,
+                    'buffer',
+                    {},
+                    { logger }
+                  );
+
+                if (
+                  Buffer.isBuffer(buffer) &&
+                  buffer.length <= maxBytes
+                ) {
+                  await sock.sendMessage(ownerJid, {
+                    image: buffer,
+
+                    caption:
+                      `Photo archive\n` +
+                      `From: ${from}\n` +
+                      `Sender: ${msg.key.participant || from}\n` +
+                      `Time: ${new Date().toISOString()}`
+                  });
+                }
+              } catch (error) {
+                console.error(
+                  '[PHOTO-ARCHIVE] Failed:',
+                  error?.message || error
+                );
+              }
+            });
+          }
+        }
+
+        /*
+         * Avoid duplicate processing.
+         */
+        const messageId = msg.key.id;
+
+        if (processedMessages.has(messageId)) {
+          continue;
+        }
+
+        /*
+         * Ignore messages older than five minutes.
+         */
+        const MESSAGE_AGE_LIMIT = 5 * 60 * 1000;
+
+        if (msg.messageTimestamp) {
+          const messageAge =
+            Date.now() -
+            Number(msg.messageTimestamp) * 1000;
+
+          if (messageAge > MESSAGE_AGE_LIMIT) {
+            continue;
+          }
+        }
+
+        processedMessages.add(messageId);
+
+        /*
+         * Save message in the in-memory store.
+         */
         if (!store.messages.has(from)) {
           store.messages.set(from, new Map());
         }
 
-        const chatMsgs = store.messages.get(from);
-        chatMsgs.set(msg.key.id, msg);
+        const chatMessages =
+          store.messages.get(from);
 
-        if (chatMsgs.size > store.maxPerChat) {
-          const sortedIds = Array.from(chatMsgs.entries())
+        chatMessages.set(messageId, msg);
+
+        while (
+          chatMessages.size > store.maxPerChat
+        ) {
+          const sortedIds = Array.from(
+            chatMessages.entries()
+          )
             .sort(
               (a, b) =>
-                (a[1].messageTimestamp || 0) -
-                (b[1].messageTimestamp || 0)
+                Number(a[1].messageTimestamp || 0) -
+                Number(b[1].messageTimestamp || 0)
             )
             .map(([id]) => id);
 
-          for (
-            let i = 0;
-            i < sortedIds.length - store.maxPerChat;
-            i++
+          const oldestId = sortedIds[0];
+
+          if (oldestId === undefined) break;
+
+          chatMessages.delete(oldestId);
+        }
+
+        /*
+         * Process commands and normal messages.
+         */
+        Promise.resolve(
+          handler.handleMessage(sock, msg)
+        ).catch(error => {
+          const message = error?.message || String(error);
+
+          if (
+            !message.includes('rate-overlimit') &&
+            !message.includes('not-authorized')
           ) {
-            chatMsgs.delete(sortedIds[i]);
+            console.error(
+              '[MESSAGE-HANDLER] Error:',
+              message
+            );
           }
-        }
-      }
+        });
 
-      // Process command immediately
-      handler.handleMessage(sock, msg).catch(err => {
-        if (
-          !err.message?.includes('rate-overlimit') &&
-          !err.message?.includes('not-authorized')
-        ) {
-          console.error(
-            'Error handling message:',
-            err.message
-          );
-        }
-      });
-
-      // Background operations
-      setImmediate(async () => {
-        if (config.autoRead && from.endsWith('@g.us')) {
-          try {
-            await sock.readMessages([msg.key]);
-          } catch (e) {
-            // Silently handle
-          }
-        }
-
-        if (from.endsWith('@g.us')) {
-          try {
-            const groupMetadata =
-              await handler.getGroupMetadata(
-                sock,
-                msg.key.remoteJid
-              );
-
-            if (groupMetadata) {
-              await handler.handleAntilink(
-                sock,
-                msg,
-                groupMetadata
-              );
+        /*
+         * Background group operations.
+         */
+        setImmediate(async () => {
+          if (
+            config.autoRead &&
+            from.endsWith('@g.us')
+          ) {
+            try {
+              await sock.readMessages([msg.key]);
+            } catch {
+              // Read receipt errors are non-fatal.
             }
-          } catch (error) {
-            // Silently handle
           }
-        }
-      });
+
+          if (from.endsWith('@g.us')) {
+            try {
+              const metadata =
+                await handler.getGroupMetadata(
+                  sock,
+                  from
+                );
+
+              if (metadata) {
+                await handler.handleAntilink(
+                  sock,
+                  msg,
+                  metadata
+                );
+              }
+            } catch {
+              // Group metadata may be temporarily unavailable.
+            }
+          }
+        });
+      }
     }
-  });
+  );
 
-  // Message receipt updates
-  sock.ev.on('message-receipt.update', () => {});
+  /*
+   * Message receipt updates.
+   */
+  sock.ev.on(
+    'message-receipt.update',
+    () => {}
+  );
 
-  // Outgoing message status diagnostics
-  sock.ev.on('messages.update', (updates) => {
-    for (const item of updates || []) {
-      console.log(
-        '[WA-STATUS]',
-        JSON.stringify({
-          id: item.key?.id,
-          remoteJid: item.key?.remoteJid,
-          fromMe: item.key?.fromMe,
-          status: item.update?.status,
-          messageStubType: item.update?.messageStubType,
-          error: item.update?.error?.message || item.update?.error
-        })
-      );
+  /*
+   * Outgoing message diagnostics.
+   */
+  sock.ev.on(
+    'messages.update',
+    updates => {
+      for (const item of updates || []) {
+        console.log(
+          '[WA-STATUS]',
+          JSON.stringify({
+            id: item.key?.id,
+            remoteJid: item.key?.remoteJid,
+            fromMe: item.key?.fromMe,
+            status: item.update?.status,
+            messageStubType:
+              item.update?.messageStubType,
+            error:
+              item.update?.error?.message ||
+              item.update?.error
+          })
+        );
+      }
     }
-  });
+  );
 
-  // Group participant updates
-  sock.ev.on('group-participants.update', async (update) => {
-    await handler.handleGroupUpdate(sock, update);
-  });
+  /*
+   * Group participant updates.
+   */
+  sock.ev.on(
+    'group-participants.update',
+    async update => {
+      try {
+        await handler.handleGroupUpdate(
+          sock,
+          update
+        );
+      } catch (error) {
+        console.error(
+          '[GROUP-UPDATE] Failed:',
+          error?.message || error
+        );
+      }
+    }
+  );
 
-  // Socket errors
-  sock.ev.on('error', (error) => {
-    const statusCode = error?.output?.statusCode;
+  /*
+   * Socket errors.
+   */
+  sock.ev.on('error', error => {
+    const statusCode =
+      error?.output?.statusCode;
 
     if (
       statusCode === 515 ||
@@ -725,19 +989,32 @@ async function startBot() {
       return;
     }
 
-    console.error('Socket error:', error.message || error);
+    console.error(
+      '[SOCKET] Error:',
+      error?.message || error
+    );
   });
 
   return sock;
 }
 
-// Multi-account supervisor
+/*
+ * Optional multi-account supervisor.
+ *
+ * WHATSAPP_ACCOUNTS=main,second,third
+ *
+ * Each account runs in a separate process.
+ */
 function startAccountSupervisor() {
-  const raw = process.env.WHATSAPP_ACCOUNTS || '';
+  const raw =
+    process.env.WHATSAPP_ACCOUNTS || '';
 
   const accountIds = [
     ...new Set(
-      raw.split(',').map(v => v.trim()).filter(Boolean)
+      raw
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
     )
   ];
 
@@ -749,21 +1026,32 @@ function startAccountSupervisor() {
   }
 
   const children = new Map();
+
   let shuttingDown = false;
 
-  const safeId = value =>
-    value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) ||
-    'account';
+  function safeId(value) {
+    return (
+      value
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 32) || 'account'
+    );
+  }
 
   console.log(
     `Starting ${accountIds.length} isolated WhatsApp account processes...`
   );
 
-  for (let index = 0; index < accountIds.length; index += 1) {
+  for (
+    let index = 0;
+    index < accountIds.length;
+    index += 1
+  ) {
     const id = safeId(accountIds[index]);
 
     const sessionName =
-      index === 0 ? config.sessionName : `session-${id}`;
+      index === 0
+        ? config.sessionName
+        : `session-${id}`;
 
     const env = {
       ...process.env,
@@ -773,9 +1061,11 @@ function startAccountSupervisor() {
       SESSION_NAME: sessionName
     };
 
-    if (index > 0) delete env.SESSION_ID;
+    if (index > 0) {
+      delete env.SESSION_ID;
+    }
 
-    const launch = () => {
+    function launch() {
       if (shuttingDown) return;
 
       console.log(
@@ -795,6 +1085,13 @@ function startAccountSupervisor() {
 
       children.set(id, child);
 
+      child.on('error', error => {
+        console.error(
+          `[accounts] Could not launch ${id}:`,
+          error?.message || error
+        );
+      });
+
       child.on('exit', (code, signal) => {
         if (shuttingDown) return;
 
@@ -802,22 +1099,38 @@ function startAccountSupervisor() {
           `[accounts] ${id} exited (${signal || code}); restarting in 5 seconds.`
         );
 
-        setTimeout(launch, 5000).unref?.();
+        const restartTimer = setTimeout(
+          launch,
+          5000
+        );
+
+        restartTimer.unref?.();
       });
-    };
+    }
 
     launch();
   }
 
-  const shutdown = () => {
+  function shutdown() {
+    if (shuttingDown) return;
+
     shuttingDown = true;
 
     for (const child of children.values()) {
-      child.kill('SIGTERM');
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // Child may already have exited.
+      }
     }
 
-    setTimeout(() => process.exit(0), 3000).unref?.();
-  };
+    const exitTimer = setTimeout(
+      () => process.exit(0),
+      3000
+    );
+
+    exitTimer.unref?.();
+  }
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
@@ -825,17 +1138,25 @@ function startAccountSupervisor() {
   return true;
 }
 
+/*
+ * Startup.
+ */
 if (!startAccountSupervisor()) {
   console.log(
-    `Starting WhatsApp MD Bot${process.env.BOT_ACCOUNT_ID ? ` [${process.env.BOT_ACCOUNT_ID}]` : ''}...\n`
+    `Starting WhatsApp MD Bot${
+      process.env.BOT_ACCOUNT_ID
+        ? ` [${process.env.BOT_ACCOUNT_ID}]`
+        : ''
+    }...\n`
   );
 
   console.log(`Bot Name: ${config.botName}`);
   console.log(`Prefix: ${config.prefix}`);
 
-  const ownerNames = Array.isArray(config.ownerName)
-    ? config.ownerName.join(',')
-    : config.ownerName;
+  const ownerNames =
+    Array.isArray(config.ownerName)
+      ? config.ownerName.join(',')
+      : config.ownerName;
 
   console.log(`Owner: ${ownerNames}\n`);
 
@@ -853,65 +1174,100 @@ if (!startAccountSupervisor()) {
 
       return startBot();
     })
-    .catch(err => {
-      console.error('Error starting bot:', err);
-      process.exit(1);
+    .catch(error => {
+      console.error(
+        'Error starting bot:',
+        error?.message || error
+      );
+
+      process.exitCode = 1;
     });
 }
 
-// Handle process termination
-process.on('uncaughtException', (err) => {
+/*
+ * Process-level error handling.
+ */
+process.on('uncaughtException', error => {
   if (
-    err.code === 'ENOSPC' ||
-    err.errno === -28 ||
-    err.message?.includes('no space left on device')
+    error?.code === 'ENOSPC' ||
+    error?.errno === -28 ||
+    error?.message?.includes('no space left on device')
   ) {
     console.error(
-      'ENOSPC Error: No space left on device. Attempting cleanup...'
+      'ENOSPC: No space left on device. Attempting cleanup...'
     );
 
-    const { cleanupOldFiles } = require('./utils/cleanup');
-    cleanupOldFiles();
+    try {
+      const { cleanupOldFiles } =
+        require('./utils/cleanup');
 
-    console.warn(
-      'Cleanup completed. Bot will continue but may experience issues until space is freed.'
-    );
+      cleanupOldFiles();
+
+      console.warn(
+        'Cleanup attempted. Check available disk space if errors continue.'
+      );
+    } catch (cleanupError) {
+      console.error(
+        'Disk cleanup failed:',
+        cleanupError?.message || cleanupError
+      );
+    }
 
     return;
   }
 
-  console.error('Uncaught Exception:', err);
+  console.error(
+    'Uncaught Exception:',
+    error
+  );
 });
 
-process.on('unhandledRejection', (err) => {
+process.on('unhandledRejection', error => {
   if (
-    err.code === 'ENOSPC' ||
-    err.errno === -28 ||
-    err.message?.includes('no space left on device')
+    error?.code === 'ENOSPC' ||
+    error?.errno === -28 ||
+    error?.message?.includes('no space left on device')
   ) {
     console.warn(
-      'ENOSPC Error in promise: No space left on device. Attempting cleanup...'
+      'ENOSPC in promise: attempting cleanup...'
     );
 
-    const { cleanupOldFiles } = require('./utils/cleanup');
-    cleanupOldFiles();
+    try {
+      const { cleanupOldFiles } =
+        require('./utils/cleanup');
 
+      cleanupOldFiles();
+    } catch (cleanupError) {
+      console.error(
+        'Cleanup failed:',
+        cleanupError?.message || cleanupError
+      );
+    }
+
+    return;
+  }
+
+  if (
+    error?.message?.includes('rate-overlimit')
+  ) {
     console.warn(
-      'Cleanup completed. Bot will continue but may experience issues until space is freed.'
+      'Rate limit reached. Slow down requests.'
     );
 
     return;
   }
 
-  if (err.message && err.message.includes('rate-overlimit')) {
-    console.warn(
-      'Rate limit reached. Please slow down your requests.'
-    );
-    return;
-  }
-
-  console.error('Unhandled Rejection:', err);
+  console.error(
+    'Unhandled Rejection:',
+    error
+  );
 });
 
-// Export store for use in commands
-module.exports = { store };
+/*
+ * Export the store for command modules.
+ */
+module.exports = {
+  store,
+  startBot,
+  cleanupPuppeteerCache
+};
