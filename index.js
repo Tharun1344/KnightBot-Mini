@@ -1,1273 +1,466 @@
+'use strict';
 
-require('dotenv').config({ override: false });
-
-/**
- * KnightBot-Mini WhatsApp MD Bot
- * Main entry point
- */
-
-process.env.PUPPETEER_SKIP_DOWNLOAD = 'true';
-process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 'true';
-process.env.PUPPETEER_CACHE_DIR =
-  process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer_cache_disabled';
-
-const { initializeTempSystem } = require('./utils/tempManager');
-const { startCleanup } = require('./utils/cleanup');
-
-initializeTempSystem();
-startCleanup();
-
-const originalConsoleLog = console.log;
-const originalConsoleError = console.error;
-const originalConsoleWarn = console.warn;
-
-const forbiddenPatternsConsole = [
-  'closing session',
-  'closing open session',
-  'sessionentry',
-  'prekey bundle',
-  'pendingprekey',
-  '_chains',
-  'registrationid',
-  'currentratchet',
-  'chainkey',
-  'ratchet',
-  'signal protocol',
-  'ephemeralkeypair',
-  'indexinfo',
-  'basekey'
-];
-
-function shouldSuppressConsole(args, patterns) {
-  const message = args
-    .map(value => {
-      if (typeof value === 'string') return value;
-
-      if (value && typeof value === 'object') {
-        try {
-          return JSON.stringify(value);
-        } catch {
-          return '[unserializable object]';
-        }
-      }
-
-      return String(value);
-    })
-    .join(' ')
-    .toLowerCase();
-
-  return patterns.some(pattern => message.includes(pattern));
+// libsignal prints huge "Closing session: SessionEntry {...}" dumps and Bad MAC traces to the console.
+// They are normal key-renegotiation noise; hide them so real errors are visible, and just count them.
+const SIGNAL_NOISE = /^(Closing session|Closing open session|Opening session|Removing old closed session|Migrating session|Decrypted message with closed session|Failed to decrypt message with any known session|Session error:)/;
+const stats = { noise: 0, msgs: 0, lastMsgAt: 0, pingFails: 0 };
+for (const m of ['log', 'info', 'warn', 'error']) {
+  const orig = console[m].bind(console);
+  console[m] = (...a) => { if (typeof a[0] === 'string' && SIGNAL_NOISE.test(a[0])) { stats.noise++; return; } orig(...a); };
 }
+process.on('unhandledRejection', err => console.error('[UNHANDLED REJECTION]', err?.stack || err));
 
-console.log = (...args) => {
-  if (!shouldSuppressConsole(args, forbiddenPatternsConsole)) {
-    originalConsoleLog.apply(console, args);
-  }
-};
-
-console.error = (...args) => {
-  if (!shouldSuppressConsole(args, forbiddenPatternsConsole)) {
-    originalConsoleError.apply(console, args);
-  }
-};
-
-console.warn = (...args) => {
-  if (!shouldSuppressConsole(args, forbiddenPatternsConsole)) {
-    originalConsoleWarn.apply(console, args);
-  }
-};
-
-const pino = require('pino');
-
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { pipeline } = require('stream/promises');
+const express = require('express');
+const P = require('pino');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  jidNormalizedUser,
+  getContentType,
   fetchLatestBaileysVersion,
-  downloadMediaMessage
+  Browsers,
+  downloadContentFromMessage,
+  WAMessageStubType,
 } = require('@whiskeysockets/baileys');
-
+const { File } = require('megajs');
 const qrcode = require('qrcode-terminal');
 const config = require('./config');
-const handler = require('./handler');
+const { sms } = require('./lib/msg');
+const { getGroupAdmins, runtime } = require('./lib/functions');
+const { commands, replyHandlers } = require('./command');
 
-const {
-  getRevokeInfo,
-  notifyDeletedMessage
-} = require('./utils/deleteAudit');
-
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
-const os = require('os');
-const { spawn } = require('child_process');
-
-/*
- * Remove Puppeteer cache when present.
- */
-function cleanupPuppeteerCache() {
-  try {
-    const cacheDir = path.join(
-      os.homedir(),
-      '.cache',
-      'puppeteer'
-    );
-
-    if (fs.existsSync(cacheDir)) {
-      console.log('Removing Puppeteer cache:', cacheDir);
-
-      fs.rmSync(cacheDir, {
-        recursive: true,
-        force: true
-      });
-
-      console.log('Puppeteer cache removed.');
-    }
-  } catch (error) {
-    console.error(
-      'Failed to clean Puppeteer cache:',
-      error?.message || error
-    );
-  }
+const ROOT = __dirname;
+const STORAGE_DIR = process.env.STORAGE_DIR || ROOT;
+const DATA_DIR = path.join(STORAGE_DIR, 'data');
+const SESSIONS_DIR = path.join(STORAGE_DIR, 'sessions');
+const LEGACY_SESSION_DIR = path.join(STORAGE_DIR, 'auth_info_baileys');
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+const PORT = Number(process.env.PORT || 8000);
+const PREFIX = process.env.PREFIX || '.';
+const logger = P({ level: process.env.LOG_LEVEL || 'info' });
+const sockets = new Map();
+const reconnectTimers = new Map();
+const reconnectAttempts = new Map();
+let settings = { mode: process.env.BOT_MODE === 'private' ? 'private' : 'public', welcome: true, goodbye: true, antiDelete: true, autoReact: false, autoReactEmoji: '❤️', mutedGroups: [], dmGreeting: true, greetedUsers: [] };
+const recentMessages = new Map();
+const MAX_CACHED_MESSAGES = 1500;
+// Anti-delete / anti-edit support (session-only; resets on restart, same as recentMessages).
+const contactNames = new Map(); // jid -> saved/pushed contact name, learned from WhatsApp contact sync
+const senderDeleteCounts = new Map(); // jid -> number of deleted messages observed this session
+const senderEditCounts = new Map(); // jid -> number of edited messages observed this session
+function extractPreviewText(messageContent) {
+  if (!messageContent) return '';
+  if (typeof messageContent.conversation === 'string') return messageContent.conversation;
+  const mt = getContentType(messageContent);
+  const wrapped = messageContent[mt];
+  return messageContent.extendedTextMessage?.text || wrapped?.caption || '';
+}
+function displayNameFor(jid, fallbackPushName) {
+  return contactNames.get(jid) || (fallbackPushName && fallbackPushName.trim()) || jid.split('@')[0];
+}
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  try { supabase = require('@supabase/supabase-js').createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false, autoRefreshToken: false } }); }
+  catch (e) { logger.warn({ err: e }, 'Supabase client unavailable'); }
 }
 
-/*
- * In-memory message store.
- */
-const store = {
-  messages: new Map(),
-  maxPerChat: 200,
-
-  bind(ev) {
-    ev.on('messages.upsert', ({ messages = [] }) => {
-      for (const msg of messages) {
-        if (!msg?.key?.id || getRevokeInfo(msg)) continue;
-
-        const jid = msg.key.remoteJid;
-        if (!jid) continue;
-
-        if (!store.messages.has(jid)) {
-          store.messages.set(jid, new Map());
-        }
-
-        const chatMessages = store.messages.get(jid);
-
-        chatMessages.set(msg.key.id, msg);
-
-        while (chatMessages.size > store.maxPerChat) {
-          const oldestKey = chatMessages.keys().next().value;
-
-          if (oldestKey === undefined) break;
-
-          chatMessages.delete(oldestKey);
-        }
-      }
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+if (fs.existsSync(SETTINGS_FILE)) {
+  try { settings = { ...settings, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) }; }
+  catch (e) { logger.warn({ err: e }, 'Invalid settings.json; defaults will be used'); }
+}
+function saveSettings() {
+  const tmp = `${SETTINGS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2));
+  fs.renameSync(tmp, SETTINGS_FILE);
+}
+function safeId(value) {
+  const id = String(value || 'default');
+  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(id)) throw new Error(`Invalid account id: ${id}`);
+  return id;
+}
+function readAccounts() {
+  if (process.env.BOT_ACCOUNTS) {
+    let parsed;
+    try { parsed = JSON.parse(process.env.BOT_ACCOUNTS); }
+    catch { throw new Error('BOT_ACCOUNTS must be valid JSON (array of account objects).'); }
+    if (!Array.isArray(parsed) || !parsed.length) throw new Error('BOT_ACCOUNTS must be a non-empty JSON array.');
+    const ids = new Set();
+    return parsed.map((item, index) => {
+      const id = safeId(item.id || `account${index + 1}`);
+      if (ids.has(id)) throw new Error(`Duplicate account id: ${id}`);
+      ids.add(id);
+      return { id, ownerNumber: String(item.ownerNumber || process.env.BOT_OWNER || config.BOT_OWNER || '').replace(/\D/g, ''), sessionId: item.sessionId || '', sessionPath: path.join(SESSIONS_DIR, id) };
     });
-  },
-
-  async loadMessage(jid, id) {
-    return store.messages.get(jid)?.get(id) || null;
   }
-};
+  // Backward compatibility: use the original session directory and SESSION_ID.
+  return [{ id: 'default', ownerNumber: String(process.env.BOT_OWNER || config.BOT_OWNER || '').replace(/\D/g, ''), sessionId: config.SESSION_ID || '', sessionPath: LEGACY_SESSION_DIR, legacy: true }];
+}
+async function restoreMegaSession(sessionId, sessionPath) {
+  const creds = path.join(sessionPath, 'creds.json');
+  if (fs.existsSync(creds)) return;
+  if (!sessionId) { logger.info({ sessionPath }, 'No imported session configured; waiting for QR pairing'); return; }
+  fs.mkdirSync(sessionPath, { recursive: true });
+  logger.info('Restoring session archive from MEGA');
+  const url = sessionId.startsWith('http') ? sessionId : `https://mega.nz/file/${sessionId}`;
+  const file = File.fromURL(url);
+  const data = await new Promise((resolve, reject) => file.download((err, buffer) => err ? reject(err) : resolve(buffer)));
+  // SESSION_ID must point to a Baileys creds.json file, not a full multi-file auth directory archive.
+  fs.writeFileSync(creds, data);
+}
+function unwrapMessage(message) {
+  let current = message;
+  while (current) {
+    const type = getContentType(current);
+    if (type === 'ephemeralMessage') current = current.ephemeralMessage?.message;
+    // Deliberately do not unwrap view-once payloads: respect the sender's one-time media setting.
+    else break;
+  }
+  return current || message;
+}
+function loadPlugins() {
+  const pluginDir = path.join(ROOT, 'plugins');
+  for (const file of fs.readdirSync(pluginDir).filter(f => f.endsWith('.js')).sort()) {
+    require(path.join(pluginDir, file));
+    logger.info(`Loaded plugin: ${file}`);
+  }
+}
+function normalizeJid(jid) { return jidNormalizedUser(String(jid || '')); }
+function getTargetJid(m, q, sender) {
+  const mentioned = m.mentionUser?.find(j => j && j !== sender);
+  if (mentioned) return normalizeJid(mentioned);
+  if (m.quoted?.sender) return normalizeJid(m.quoted.sender);
+  const number = String(q || '').replace(/\D/g, '');
+  return number.length >= 7 ? `${number}@s.whatsapp.net` : null;
+}
 
-/*
- * Message deduplication.
- */
-const processedMessages = new Set();
+loadPlugins();
 
-const processedMessagesCleanup = setInterval(() => {
-  processedMessages.clear();
-}, 5 * 60 * 1000);
+async function handleMessage(sock, account, incoming) {
+  if (!incoming?.message || incoming.key?.remoteJid === 'status@broadcast') return;
+  const rawMessage = incoming.message;
+  let probe = rawMessage;
+  while (probe && getContentType(probe) === 'ephemeralMessage') probe = probe.ephemeralMessage?.message;
+  const rawType = getContentType(probe || rawMessage);
+  const isViewOnce = ['viewOnceMessage','viewOnceMessageV2','viewOnceMessageV2Extension'].includes(rawType);
+  incoming.message = unwrapMessage(rawMessage);
+  if (isViewOnce) {
+    const senderJid = normalizeJid(incoming.key.participant || incoming.key.remoteJid);
+    const accountOwner = account.ownerNumber ? `${account.ownerNumber}@s.whatsapp.net` : '';
+    if (accountOwner) await sock.sendMessage(accountOwner, { text: `🔒 View-once media received in ${incoming.key.remoteJid}. DANUWA-MD does not save or bypass view-once media protections.` }).catch(() => {});
+    return;
+  }
+  const m = sms(sock, incoming);
+  const from = incoming.key.remoteJid;
+  const body = String(m.body || '').trim();
+  const isCmd = body.startsWith(PREFIX);
+  const pieces = isCmd ? body.slice(PREFIX.length).trim().split(/\s+/) : [];
+  const commandName = (pieces.shift() || '').toLowerCase();
+  const args = pieces;
+  const q = args.join(' ');
+  const sender = normalizeJid(m.sender || incoming.key.participant || from);
+  const senderNumber = sender.split('@')[0].split(':')[0];
+  const isGroup = from.endsWith('@g.us');
+  if (isGroup && settings.mutedGroups.includes(from) && commandName !== 'mute' && !incoming.key.fromMe && !(account.ownerNumber && account.ownerNumber === String(sender).split('@')[0].split(':')[0])) return;
+  const botNumber = String(sock.user?.id || '').split(':')[0].split('@')[0];
+  const isMe = Boolean(incoming.key.fromMe) || senderNumber === botNumber;
+  const isOwner = isMe || (account.ownerNumber && account.ownerNumber === senderNumber);
+  const groupMetadata = isGroup ? await sock.groupMetadata(from).catch(() => null) : null;
+  const participants = groupMetadata?.participants || [];
+  const groupAdmins = isGroup ? getGroupAdmins(participants).map(normalizeJid) : [];
+  const botJid = normalizeJid(sock.user?.id || '');
+  // New WhatsApp groups use LID addressing, so admin ids are '...@lid' while sock.user.id is a phone JID.
+  // Compare against BOTH of the bot's identities, otherwise ".kick" always says "make the bot an admin first".
+  const botLid = normalizeJid(sock.user?.lid || '');
+  const botIds = [botJid, botLid].filter(Boolean);
+  const isBotAdmins = isGroup && botIds.some(j => groupAdmins.includes(j));
+  const isAdmins = isGroup && groupAdmins.includes(sender);
+  const reply = (text, options = {}) => sock.sendMessage(from, { text: String(text), ...options }, { quoted: incoming }).catch(err => { console.error(`[SEND FAILED] to ${from} ->`, err?.message || err); throw err; });
 
-processedMessagesCleanup.unref?.();
+  if (settings.mode === 'private') {
+    // Private means owner self-chat only; do not accept other private chats or groups.
+    const ownerJid = account.ownerNumber ? `${account.ownerNumber}@s.whatsapp.net` : '';
+    if (!ownerJid || from !== ownerJid || !(incoming.key.fromMe || senderNumber === account.ownerNumber)) return;
+  }
 
-/*
- * Suppressed Pino logger.
- */
-function createSuppressedLogger(level = 'silent') {
-  const forbiddenPatterns = [
-    ...forbiddenPatternsConsole,
-    'ratchetkey'
-  ];
+  // One-time greeting for a brand-new private chat. Fires before the
+  // command handling below so it doesn't interfere with a first message
+  // that is itself a command.
+  if (!isGroup && !incoming.key.fromMe && settings.dmGreeting && !settings.greetedUsers.includes(sender)) {
+    settings.greetedUsers.push(sender);
+    if (settings.greetedUsers.length > 5000) settings.greetedUsers.splice(0, settings.greetedUsers.length - 5000);
+    saveSettings();
+    const greeting = (config.GREETING_MSG && config.GREETING_MSG.trim()) || [
+      `ආයුබෝවන්${incoming.pushName ? `, ${incoming.pushName}` : ''}! 👋`,
+      `මේ *${config.BOT_NAME}* — ${config.OWNER_NAME} ගේ WhatsApp bot එක.`,
+      `මොනවද කරන්න පුළුවන්ද බලන්න *${PREFIX}menu*, bot/developer ගැන බලන්න *${PREFIX}alive* කියලා යවන්න.`,
+    ].join('\n');
+    await sock.sendMessage(from, { text: greeting }).catch(err => logger.debug({ err: err.message }, 'DM greeting failed'));
+  }
 
-  let logger;
+  const context = {
+    from, quoted: incoming, body, isCmd, command: commandName, args, q, isGroup, sender, prefix: PREFIX,
+    senderNumber, botNumber, botNumber2: botJid, botIds, pushname: incoming.pushName || 'WhatsApp User',
+    isMe, isOwner, groupMetadata, groupName: groupMetadata?.subject || '', participants,
+    groupAdmins, isBotAdmins, isAdmins, reply, accountId: account.id, settings,
+    getTargetJid: () => getTargetJid(m, q, sender),
+  };
+  if (isCmd && commandName) {
+    const plugin = commands.find(c => String(c.pattern || '').toLowerCase() === commandName || (c.alias || []).map(a => String(a).toLowerCase()).includes(commandName));
+    if (plugin) {
+      if (plugin.fromMe && !isOwner) return reply('⛔ Owner only command.');
+      // React only to recognized bot commands, never to ordinary chat messages.
+      const reactEmoji = plugin.react || (settings.autoReact ? settings.autoReactEmoji : '');
+      if (reactEmoji) await sock.sendMessage(from, { react: { text: String(reactEmoji).slice(0, 16), key: incoming.key } }).catch(() => {});
+      try { await plugin.function(sock, incoming, m, context); }
+      catch (err) { console.error(`[COMMAND FAILED] .${commandName} ->`, err?.stack || err); logger.error({ err, commandName, accountId: account.id }, 'Command failed'); await reply('❌ Command failed. Check the bot logs.').catch(() => {}); }
+    } else {
+      await reply(`❓ Unknown command: ${PREFIX}${commandName}\nUse ${PREFIX}menu to see available commands.`).catch(() => {});
+    }
+  }
+  for (const handler of replyHandlers) {
+    try {
+      if (handler.filter(body, { sender, message: incoming })) {
+        await handler.function(sock, incoming, m, { ...context, body });
+        break;
+      }
+    } catch (err) { logger.error({ err, accountId: account.id }, 'Reply handler failed'); }
+  }
+}
 
+async function connectAccount(account) {
+  const id = account.id;
+  if (sockets.has(id)) return;
   try {
-    logger = pino({
-      level,
-
-      transport:
-        process.env.NODE_ENV === 'production'
-          ? undefined
-          : {
-              target: 'pino-pretty',
-              options: {
-                colorize: true,
-                ignore: 'pid,hostname'
-              }
-            },
-
-      redact: [
-        'registrationId',
-        'ephemeralKeyPair',
-        'rootKey',
-        'chainKey',
-        'baseKey'
-      ]
+    fs.mkdirSync(account.sessionPath, { recursive: true });
+    await restoreMegaSession(account.sessionId, account.sessionPath);
+    const { state, saveCreds } = await useMultiFileAuthState(account.sessionPath);
+    const { version } = await fetchLatestBaileysVersion();
+    const sock = makeWASocket({
+      logger: P({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' }),
+      printQRInTerminal: false,
+      browser: Browsers.macOS('Firefox'),
+      auth: state,
+      version,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false,
     });
-  } catch {
-    logger = pino({ level });
-  }
-
-  const originalInfo = logger.info.bind(logger);
-
-  logger.info = (...args) => {
-    if (!shouldSuppressConsole(args, forbiddenPatterns)) {
-      originalInfo(...args);
-    }
-  };
-
-  logger.debug = () => {};
-  logger.trace = () => {};
-
-  return logger;
-}
-
-/*
- * Pairing number configuration.
- *
- * Set this in the hosting panel:
- * PAIRING_NUMBER=947XXXXXXXX
- *
- * Use the complete international number:
- * - Include the country code.
- * - Do not include a plus sign.
- * - Do not include spaces or hyphens.
- *
- * If the existing session is already registered,
- * the saved session will be reused.
- */
-function getPairingConfiguration(state) {
-  const raw = String(
-    process.env.PAIRING_NUMBER || ''
-  ).trim();
-
-  const number = raw.replace(/\D/g, '');
-
-  const valid = /^\d{8,15}$/.test(number);
-
-  const mode =
-    Boolean(raw) &&
-    valid &&
-    !state.creds.registered;
-
-  if (raw && !valid) {
-    console.error(
-      '[PAIRING] Invalid PAIRING_NUMBER. Use the full international number with digits only.'
-    );
-  }
-
-  if (raw && valid && state.creds.registered) {
-    console.log(
-      '[PAIRING] An existing registered session was found. Reusing saved credentials.'
-    );
-  }
-
-  if (!raw && !state.creds.registered) {
-    console.log(
-      '[PAIRING] PAIRING_NUMBER is not configured. QR login will be used.'
-    );
-  }
-
-  return {
-    number,
-    mode
-  };
-}
-
-/*
- * Main WhatsApp connection.
- */
-async function startBot() {
-  const sessionFolder = path.join(
-    __dirname,
-    config.sessionName
-  );
-
-  const sessionFile = path.join(
-    sessionFolder,
-    'creds.json'
-  );
-
-  /*
-   * Import a supplied KnightBot session, if configured.
-   */
-  if (
-    config.sessionID &&
-    config.sessionID.startsWith('KnightBot!')
-  ) {
-    try {
-      const [header, base64Data] =
-        config.sessionID.split('!');
-
-      if (header !== 'KnightBot' || !base64Data) {
-        throw new Error(
-          "Invalid session format. Expected 'KnightBot!.....'."
-        );
-      }
-
-      const cleanBase64 = base64Data.replace('...', '');
-
-      const compressedData = Buffer.from(
-        cleanBase64,
-        'base64'
-      );
-
-      const decompressedData = zlib.gunzipSync(
-        compressedData
-      );
-
-      fs.mkdirSync(sessionFolder, {
-        recursive: true
-      });
-
-      fs.writeFileSync(
-        sessionFile,
-        decompressedData,
-        'utf8'
-      );
-
-      console.log(
-        'Session retrieved from KnightBot Session.'
-      );
-    } catch (error) {
-      console.error(
-        'Error processing KnightBot session:',
-        error?.message || error
-      );
-    }
-  }
-
-  const { state, saveCreds } =
-    await useMultiFileAuthState(sessionFolder);
-
-  const { version } =
-    await fetchLatestBaileysVersion();
-
-  const logger = createSuppressedLogger('silent');
-
-  const {
-    number: pairingNumber,
-    mode: pairingMode
-  } = getPairingConfiguration(state);
-
-  const sock = makeWASocket({
-    version,
-    logger,
-
-    printQRInTerminal: false,
-
-    browser: [
-      'Chrome',
-      'Windows',
-      '10.0'
-    ],
-
-    auth: state,
-
-    syncFullHistory: false,
-    downloadHistory: false,
-    markOnlineOnConnect: false,
-
-    getMessage: async () => undefined
-  });
-
-  /*
-   * Pairing-code fix:
-   *
-   * Do not use an arbitrary setTimeout to request a code.
-   * Wait for Baileys to emit its QR/registration event,
-   * then request a code only once for this socket.
-   */
-  let pairingCodeRequested = false;
-
-  /*
-   * Store messages.
-   */
-  store.bind(sock.ev);
-
-  /*
-   * Socket inactivity watchdog.
-   */
-  let lastActivity = Date.now();
-
-  const INACTIVITY_TIMEOUT = 30 * 60 * 1000;
-
-  sock.ev.on('messages.upsert', () => {
-    lastActivity = Date.now();
-  });
-
-  const watchdogInterval = setInterval(async () => {
-    try {
-      if (
-        Date.now() - lastActivity > INACTIVITY_TIMEOUT &&
-        sock.ws?.readyState === 1
-      ) {
-        console.log(
-          'No activity detected. Reconnecting socket...'
-        );
-
-        clearInterval(watchdogInterval);
-
-        await sock.end(undefined, undefined, {
-          reason: 'inactive'
-        });
-
-        setTimeout(() => {
-          startBot().catch(error => {
-            console.error(
-              '[WATCHDOG] Restart failed:',
-              error?.message || error
-            );
-          });
-        }, 5000);
-      }
-    } catch (error) {
-      console.error(
-        '[WATCHDOG] Error:',
-        error?.message || error
-      );
-    }
-  }, 5 * 60 * 1000);
-
-  watchdogInterval.unref?.();
-
-  sock.ev.on('connection.update', update => {
-    const { connection } = update;
-
-    if (connection === 'open') {
-      lastActivity = Date.now();
-    }
-
-    if (connection === 'close') {
-      clearInterval(watchdogInterval);
-    }
-  });
-
-  /*
-   * Connection updates and login.
-   */
-  sock.ev.on(
-    'connection.update',
-    async update => {
-      const {
-        connection,
-        lastDisconnect,
-        qr
-      } = update;
-
-      /*
-       * Pairing-code login.
-       */
-      if (
-        qr &&
-        pairingMode &&
-        !pairingCodeRequested
-      ) {
-        pairingCodeRequested = true;
-
-        try {
-          if (
-            typeof sock.requestPairingCode !== 'function'
-          ) {
-            throw new Error(
-              'requestPairingCode() is unavailable in the installed Baileys version.'
-            );
-          }
-
-          const code =
-            await sock.requestPairingCode(
-              pairingNumber
-            );
-
-          console.log(
-            '\n========================================'
-          );
-          console.log(
-            ' WHATSAPP PHONE-NUMBER PAIRING CODE'
-          );
-          console.log(
-            '========================================'
-          );
-
-          console.log(`\n  ${code}\n`);
-
-          console.log('On your phone:');
-          console.log('1. Open WhatsApp.');
-          console.log('2. Open Linked devices.');
-          console.log('3. Tap Link a device.');
-          console.log(
-            '4. Choose Link with phone number instead.'
-          );
-          console.log(
-            '5. Enter the newly generated code promptly.'
-          );
-
-          console.log(
-            '\nDo not share this code with anyone.'
-          );
-
-          console.log(
-            '========================================\n'
-          );
-        } catch (error) {
-          /*
-           * Permit a later QR update to retry if the
-           * initial pairing-code request fails.
-           */
-          pairingCodeRequested = false;
-
-          console.error(
-            '[PAIRING] Failed to request pairing code:',
-            error?.message || error
-          );
-
-          console.error(
-            '[PAIRING] Check PAIRING_NUMBER, your saved session, and the installed Baileys version.'
-          );
-        }
-      } else if (qr && !pairingMode) {
-        /*
-         * Standard QR login remains available when
-         * pairing mode is not enabled.
-         */
-        console.log(
-          '\n\nScan this QR code with WhatsApp:\n'
-        );
-
-        qrcode.generate(qr, {
-          small: true
-        });
-      }
-
-      /*
-       * Handle connection closures.
-       */
-      if (connection === 'close') {
-        const statusCode =
-          lastDisconnect?.error?.output?.statusCode;
-
-        const errorMessage =
-          lastDisconnect?.error?.message ||
-          'Unknown error';
-
-        const shouldReconnect =
-          statusCode !== DisconnectReason.loggedOut;
-
-        if (
-          statusCode === 515 ||
-          statusCode === 503 ||
-          statusCode === 408
-        ) {
-          console.log(
-            `Connection closed (${statusCode}).`
-          );
-        } else {
-          console.log(
-            'Connection closed:',
-            errorMessage
-          );
-        }
-
-        if (shouldReconnect) {
-          setTimeout(() => {
-            startBot().catch(error => {
-              console.error(
-                '[RECONNECT] Restart failed:',
-                error?.message || error
-              );
-            });
-          }, 3000);
-        } else {
-          console.error(
-            '[AUTH] WhatsApp logged out. Remove the old session only if you intend to pair again.'
-          );
-        }
-
-        return;
-      }
-
-      /*
-       * Successful connection.
-       */
-      if (connection === 'open') {
-        lastActivity = Date.now();
-
-        console.log(
-          '\nBot connected successfully!'
-        );
-
-        console.log(
-          `Bot Number: ${sock.user?.id?.split(':')[0] || 'Unknown'}`
-        );
-
-        console.log(
-          `Bot Name: ${config.botName}`
-        );
-
-        console.log(
-          `Prefix: ${config.prefix}`
-        );
-
-        const ownerNames =
-          Array.isArray(config.ownerName)
-            ? config.ownerName.join(',')
-            : config.ownerName;
-
-        console.log(
-          `Owner: ${ownerNames}\n`
-        );
-
-        console.log(
-          'Bot is ready to receive messages!\n'
-        );
-
-        if (config.autoBio) {
-          try {
-            await sock.updateProfileStatus(
-              `${config.botName} | Active 24/7`
-            );
-          } catch (error) {
-            console.error(
-              '[PROFILE] Could not update status:',
-              error?.message || error
-            );
-          }
-        }
-
-        try {
-          handler.initializeAntiCall(sock);
-        } catch (error) {
-          console.error(
-            '[ANTICALL] Initialization failed:',
-            error?.message || error
-          );
-        }
-
-        /*
-         * Clean old stored chats.
-         */
-        const now = Date.now();
-
-        for (
-          const [jid, chatMessages]
-          of store.messages.entries()
-        ) {
-          const timestamps = Array.from(
-            chatMessages.values()
-          ).map(message =>
-            Number(message.messageTimestamp || 0) * 1000
-          );
-
-          if (
-            timestamps.length > 0 &&
-            now - Math.max(...timestamps) >
-              24 * 60 * 60 * 1000
-          ) {
-            store.messages.delete(jid);
-          }
-        }
-
-        console.log(
-          `Store cleaned. Active chats: ${store.messages.size}`
-        );
-      }
-    }
-  );
-
-  /*
-   * Save updated WhatsApp credentials.
-   */
-  sock.ev.on('creds.update', saveCreds);
-
-  /*
-   * Ignore system/broadcast JIDs.
-   */
-  function isSystemJid(jid) {
-    if (!jid) return true;
-
-    return (
-      jid.includes('@broadcast') ||
-      jid.includes('status.broadcast') ||
-      jid.includes('@newsletter') ||
-      jid.includes('@newsletter.')
-    );
-  }
-
-  /*
-   * Incoming message handler.
-   */
-  sock.ev.on(
-    'messages.upsert',
-    ({ messages = [], type }) => {
-      if (type !== 'notify') return;
-
-      for (const msg of messages) {
-        /*
-         * Deleted-message auditing.
-         */
-        if (getRevokeInfo(msg)) {
-          void notifyDeletedMessage(sock, msg, {
-            store,
-            config,
-            getGroupMetadata: handler.getGroupMetadata
-          });
-
-          continue;
-        }
-
-        if (!msg.message || !msg.key?.id) {
-          continue;
-        }
-
-        const from = msg.key.remoteJid;
-
-        if (!from || isSystemJid(from)) {
-          continue;
-        }
-
-        /*
-         * Optional photo-only archive.
-         * This forwards images only, not all message types.
-         */
-        if (
-          config.photoArchive?.enabled &&
-          !msg.key.fromMe &&
-          msg.message?.imageMessage
-        ) {
-          const image = msg.message.imageMessage;
-
-          const declaredSize = Number(
-            image.fileLength || 0
-          );
-
-          const owner = Array.isArray(config.ownerNumber)
-            ? config.ownerNumber[0]
-            : config.ownerNumber;
-
-          const ownerJid = owner
-            ? (
-                String(owner).includes('@')
-                  ? String(owner)
-                  : `${String(owner).replace(/\D/g, '')}@s.whatsapp.net`
-              )
-            : '';
-
-          const maxBytes = Number(
-            config.photoArchive.maxBytes || 8388608
-          );
-
-          if (
-            ownerJid &&
-            (!declaredSize || declaredSize <= maxBytes)
-          ) {
-            setImmediate(async () => {
+    let pairingRequested = false;
+    sockets.set(id, sock);
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', async update => {
+      if (update.qr) {
+        // Pairing-code login: no giant QR in Railway logs. Set PAIRING_NUMBER (e.g. 94771234567) to use it.
+        const pairNumber = String(process.env.PAIRING_NUMBER || account.ownerNumber || '').replace(/\D/g, '');
+        if (pairNumber && !sock.authState?.creds?.registered) {
+          if (!pairingRequested) {
+            pairingRequested = true;
+            setTimeout(async () => {
               try {
-                const buffer =
-                  await downloadMediaMessage(
-                    msg,
-                    'buffer',
-                    {},
-                    { logger }
-                  );
-
-                if (
-                  Buffer.isBuffer(buffer) &&
-                  buffer.length <= maxBytes
-                ) {
-                  await sock.sendMessage(ownerJid, {
-                    image: buffer,
-
-                    caption:
-                      `Photo archive\n` +
-                      `From: ${from}\n` +
-                      `Sender: ${msg.key.participant || from}\n` +
-                      `Time: ${new Date().toISOString()}`
-                  });
-                }
-              } catch (error) {
-                console.error(
-                  '[PHOTO-ARCHIVE] Failed:',
-                  error?.message || error
-                );
-              }
-            });
+                const raw = await sock.requestPairingCode(pairNumber);
+                const code = String(raw).match(/.{1,4}/g)?.join('-') || raw;
+                console.log(`\n========== WHATSAPP PAIRING CODE: ${code} ==========\nWhatsApp > Linked devices > Link a device > "Link with phone number instead" > enter this code\n`);
+              } catch (err) { pairingRequested = false; logger.warn({ err: err.message, accountId: id }, 'Pairing code request failed'); }
+            }, 3000);
           }
+        } else {
+          logger.info({ accountId: id }, 'Scan this QR with WhatsApp > Linked devices > Link a device (or set PAIRING_NUMBER to use a pairing code instead)');
+          qrcode.generate(update.qr, { small: true });
         }
-
-        /*
-         * Avoid duplicate processing.
-         */
-        const messageId = msg.key.id;
-
-        if (processedMessages.has(messageId)) {
-          continue;
-        }
-
-        /*
-         * Ignore messages older than five minutes.
-         */
-        const MESSAGE_AGE_LIMIT = 5 * 60 * 1000;
-
-        if (msg.messageTimestamp) {
-          const messageAge =
-            Date.now() -
-            Number(msg.messageTimestamp) * 1000;
-
-          if (messageAge > MESSAGE_AGE_LIMIT) {
-            continue;
-          }
-        }
-
-        processedMessages.add(messageId);
-
-        /*
-         * Save message in the in-memory store.
-         */
-        if (!store.messages.has(from)) {
-          store.messages.set(from, new Map());
-        }
-
-        const chatMessages =
-          store.messages.get(from);
-
-        chatMessages.set(messageId, msg);
-
-        while (
-          chatMessages.size > store.maxPerChat
-        ) {
-          const sortedIds = Array.from(
-            chatMessages.entries()
-          )
-            .sort(
-              (a, b) =>
-                Number(a[1].messageTimestamp || 0) -
-                Number(b[1].messageTimestamp || 0)
-            )
-            .map(([id]) => id);
-
-          const oldestId = sortedIds[0];
-
-          if (oldestId === undefined) break;
-
-          chatMessages.delete(oldestId);
-        }
-
-        /*
-         * Process commands and normal messages.
-         */
-        Promise.resolve(
-          handler.handleMessage(sock, msg)
-        ).catch(error => {
-          const message = error?.message || String(error);
-
-          if (
-            !message.includes('rate-overlimit') &&
-            !message.includes('not-authorized')
-          ) {
-            console.error(
-              '[MESSAGE-HANDLER] Error:',
-              message
-            );
-          }
-        });
-
-        /*
-         * Background group operations.
-         */
-        setImmediate(async () => {
-          if (
-            config.autoRead &&
-            from.endsWith('@g.us')
-          ) {
-            try {
-              await sock.readMessages([msg.key]);
-            } catch {
-              // Read receipt errors are non-fatal.
-            }
-          }
-
-          if (from.endsWith('@g.us')) {
-            try {
-              const metadata =
-                await handler.getGroupMetadata(
-                  sock,
-                  from
-                );
-
-              if (metadata) {
-                await handler.handleAntilink(
-                  sock,
-                  msg,
-                  metadata
-                );
-              }
-            } catch {
-              // Group metadata may be temporarily unavailable.
-            }
-          }
-        });
       }
-    }
-  );
-
-  /*
-   * Message receipt updates.
-   */
-  sock.ev.on(
-    'message-receipt.update',
-    () => {}
-  );
-
-  /*
-   * Outgoing message diagnostics.
-   */
-  sock.ev.on(
-    'messages.update',
-    updates => {
-      for (const item of updates || []) {
-        console.log(
-          '[WA-STATUS]',
-          JSON.stringify({
-            id: item.key?.id,
-            remoteJid: item.key?.remoteJid,
-            fromMe: item.key?.fromMe,
-            status: item.update?.status,
-            messageStubType:
-              item.update?.messageStubType,
-            error:
-              item.update?.error?.message ||
-              item.update?.error
-          })
-        );
-      }
-    }
-  );
-
-  /*
-   * Group participant updates.
-   */
-  sock.ev.on(
-    'group-participants.update',
-    async update => {
-      try {
-        await handler.handleGroupUpdate(
-          sock,
-          update
-        );
-      } catch (error) {
-        console.error(
-          '[GROUP-UPDATE] Failed:',
-          error?.message || error
-        );
-      }
-    }
-  );
-
-  /*
-   * Socket errors.
-   */
-  sock.ev.on('error', error => {
-    const statusCode =
-      error?.output?.statusCode;
-
-    if (
-      statusCode === 515 ||
-      statusCode === 503 ||
-      statusCode === 408
-    ) {
-      return;
-    }
-
-    console.error(
-      '[SOCKET] Error:',
-      error?.message || error
-    );
-  });
-
-  return sock;
-}
-
-/*
- * Optional multi-account supervisor.
- *
- * WHATSAPP_ACCOUNTS=main,second,third
- *
- * Each account runs in a separate process.
- */
-function startAccountSupervisor() {
-  const raw =
-    process.env.WHATSAPP_ACCOUNTS || '';
-
-  const accountIds = [
-    ...new Set(
-      raw
-        .split(',')
-        .map(value => value.trim())
-        .filter(Boolean)
-    )
-  ];
-
-  if (
-    process.env.BOT_ACCOUNT_CHILD === '1' ||
-    accountIds.length <= 1
-  ) {
-    return false;
-  }
-
-  const children = new Map();
-
-  let shuttingDown = false;
-
-  function safeId(value) {
-    return (
-      value
-        .replace(/[^a-zA-Z0-9_-]/g, '')
-        .slice(0, 32) || 'account'
-    );
-  }
-
-  console.log(
-    `Starting ${accountIds.length} isolated WhatsApp account processes...`
-  );
-
-  for (
-    let index = 0;
-    index < accountIds.length;
-    index += 1
-  ) {
-    const id = safeId(accountIds[index]);
-
-    const sessionName =
-      index === 0
-        ? config.sessionName
-        : `session-${id}`;
-
-    const env = {
-      ...process.env,
-      BOT_ACCOUNT_CHILD: '1',
-      BOT_ACCOUNT_INDEX: String(index),
-      BOT_ACCOUNT_ID: id,
-      SESSION_NAME: sessionName
-    };
-
-    if (index > 0) {
-      delete env.SESSION_ID;
-    }
-
-    function launch() {
-      if (shuttingDown) return;
-
-      console.log(
-        `[accounts] Launching ${id} (${sessionName})`
-      );
-
-      const child = spawn(
-        process.execPath,
-        [__filename],
-        {
-          cwd: __dirname,
-          env,
-          stdio: 'inherit',
-          windowsHide: true
+      if (update.connection === 'open') {
+        reconnectAttempts.set(id, 0);
+        logger.info({ accountId: id, user: sock.user?.id }, 'WhatsApp account connected');
+        const selfJid = normalizeJid(sock.user?.id || '');
+        if (selfJid) {
+          await sock.sendMessage(selfJid, { text: `✅ DANUWA-MD connected\nAccount: ${id}\nPrefix: ${PREFIX}` }).catch(err => logger.warn({ err, accountId: id }, 'Owner notification failed'));
         }
-      );
-
-      children.set(id, child);
-
-      child.on('error', error => {
-        console.error(
-          `[accounts] Could not launch ${id}:`,
-          error?.message || error
-        );
-      });
-
-      child.on('exit', (code, signal) => {
-        if (shuttingDown) return;
-
-        console.error(
-          `[accounts] ${id} exited (${signal || code}); restarting in 5 seconds.`
-        );
-
-        const restartTimer = setTimeout(
-          launch,
-          5000
-        );
-
-        restartTimer.unref?.();
-      });
-    }
-
-    launch();
-  }
-
-  function shutdown() {
-    if (shuttingDown) return;
-
-    shuttingDown = true;
-
-    for (const child of children.values()) {
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // Child may already have exited.
+        try { require('./lib/scheduler').start(id, sock, logger); } catch (err) { logger.warn({ err: err.message }, 'Scheduler failed to start'); }
       }
-    }
-
-    const exitTimer = setTimeout(
-      () => process.exit(0),
-      3000
-    );
-
-    exitTimer.unref?.();
-  }
-
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
-  return true;
-}
-
-/*
- * Startup.
- */
-if (!startAccountSupervisor()) {
-  console.log(
-    `Starting WhatsApp MD Bot${
-      process.env.BOT_ACCOUNT_ID
-        ? ` [${process.env.BOT_ACCOUNT_ID}]`
-        : ''
-    }...\n`
-  );
-
-  console.log(`Bot Name: ${config.botName}`);
-  console.log(`Prefix: ${config.prefix}`);
-
-  const ownerNames =
-    Array.isArray(config.ownerName)
-      ? config.ownerName.join(',')
-      : config.ownerName;
-
-  console.log(`Owner: ${ownerNames}\n`);
-
-  const database = require('./database');
-
-  database.ready()
-    .then(() => {
-      console.log(
-        database.isSupabaseEnabled()
-          ? 'Database: Supabase (healthy)'
-          : database.isSupabaseConfigured()
-            ? 'Database: Supabase configured but unhealthy; local JSON fallback active'
-            : 'Database: local JSON (Supabase not configured)'
-      );
-
-      return startBot();
-    })
-    .catch(error => {
-      console.error(
-        'Error starting bot:',
-        error?.message || error
-      );
-
-      process.exitCode = 1;
+      if (update.connection === 'close') {
+        sockets.delete(id);
+        const statusCode = update.lastDisconnect?.error?.output?.statusCode;
+        if (statusCode === DisconnectReason.loggedOut) {
+          logger.error({ accountId: id }, 'WhatsApp session logged out; re-pair this account before restarting it.');
+          return;
+        }
+        const attempts = (reconnectAttempts.get(id) || 0) + 1;
+        reconnectAttempts.set(id, attempts);
+        const delay = Math.min(60000, 1500 * (2 ** Math.min(attempts - 1, 5)));
+        logger.warn({ accountId: id, statusCode, delay }, 'Connection closed; reconnect scheduled');
+        clearTimeout(reconnectTimers.get(id));
+        reconnectTimers.set(id, setTimeout(() => connectAccount(account), delay));
+      }
     });
+    // Learn display names from WhatsApp's own contact sync so anti-delete/edit
+    // notices can show a saved name instead of a bare number when possible.
+    // (Coverage depends on how much WhatsApp syncs to this linked device.)
+    const cacheContacts = list => {
+      for (const c of list || []) {
+        const jid = normalizeJid(c.id);
+        const name = c.name || c.notify || c.verifiedName;
+        if (jid && name) contactNames.set(jid, name);
+      }
+    };
+    sock.ev.on('contacts.upsert', cacheContacts);
+    sock.ev.on('contacts.update', cacheContacts);
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      stats.msgs += messages.length; stats.lastMsgAt = Date.now();
+      for (const message of messages) {
+        if (message?.key?.id && message.message && !message.key.fromMe) {
+          const content = unwrapMessage(message.message);
+          const mt = getContentType(content);
+          const text = extractPreviewText(content);
+          recentMessages.set(message.key.id, {
+            key: message.key, chat: message.key.remoteJid, sender: normalizeJid(message.key.participant || message.key.remoteJid),
+            pushName: message.pushName || '', text: String(text || '').slice(0, 2000), type: mt, timestamp: Date.now(),
+          });
+          if (recentMessages.size > MAX_CACHED_MESSAGES) recentMessages.delete(recentMessages.keys().next().value);
+        }
+        try { await handleMessage(sock, account, message); }
+        catch (err) { console.error('[MESSAGE HANDLER FAILED]', err?.stack || err); logger.error({ err, accountId: id }, 'Message handler failed'); }
+      }
+    });
+    sock.ev.on('messages.update', async updates => {
+      if (process.env.ANTIDELETE_ENABLED === 'false' || !settings.antiDelete) return;
+      // Always report to the linked account's own self-chat (works even if BOT_OWNER is not set).
+      const owner = normalizeJid(sock.user?.id || '');
+      if (!owner) return;
+      for (const item of updates || []) {
+        const update = item.update || {};
+        // Baileys normalizes a WhatsApp "delete for everyone" (REVOKE) into a
+        // messages.update item with update.message === null and
+        // update.messageStubType === REVOKE — it is NOT delivered as
+        // update.message.protocolMessage. An edit instead arrives with
+        // update.message set to the new content. Key placement also varies
+        // between event shapes, so every plausible location is checked.
+        const msgId = item.key?.id || item.id || update.key?.id;
+        if (!msgId) continue;
+        const cached = recentMessages.get(msgId);
+        if (!cached) continue; // nothing we observed to report
+        const isRevoke = update.messageStubType === WAMessageStubType.REVOKE || (update.message === null && update.messageStubType !== undefined);
+        const isEdit = !isRevoke && !!update.message;
+        if (!isRevoke && !isEdit) continue;
+        const name = displayNameFor(cached.sender, cached.pushName);
+        let chatLabel = '👤 Private chat';
+        if (String(cached.chat).endsWith('@g.us')) {
+          const gm = await sock.groupMetadata(cached.chat).catch(() => null);
+          chatLabel = `👥 Group: ${gm?.subject || cached.chat}`;
+        }
+        if (isRevoke) {
+          recentMessages.delete(msgId);
+          const count = (senderDeleteCounts.get(cached.sender) || 0) + 1;
+          senderDeleteCounts.set(cached.sender, count);
+          const note = [
+            '🛡️ *Anti-delete notice*',
+            `📍 ${chatLabel}`,
+            `👤 Sender: ${name} (${cached.sender.split('@')[0]}${cached.sender.endsWith('@lid') ? ' • LID' : ''})`,
+            `🔁 Deleted messages from this sender (this session): ${count}`,
+            `🧾 Type: ${cached.type || 'message'}`,
+            `💬 Text: ${cached.text || '[No text / media message]'}`,
+            '',
+            'ℹ️ Only messages cached while the bot was online can be reported; deleted media is not guaranteed to be recoverable.',
+          ].join('\n');
+          await sock.sendMessage(owner, { text: note }).catch(err => logger.warn({ err, accountId: id }, 'Anti-delete owner notice failed'));
+          if (supabase) {
+            try { await supabase.from(process.env.SUPABASE_AUDIT_TABLE || 'bot_audit_events').insert({ account_id: id, event_type: 'message_deleted', chat_jid: cached.chat, sender_jid: cached.sender, message_type: cached.type || 'message', message_text: cached.text || null, created_at: new Date().toISOString() }); }
+            catch (err) { logger.warn({ err: err.message }, 'Supabase audit insert failed; ensure table/schema exists'); }
+          }
+        } else {
+          // Baileys wraps an edit's new content as { editedMessage: { message: <actual content> } },
+          // not as the content directly — unwrap that layer before extracting text.
+          const editedPayload = update.message?.editedMessage?.message || update.message;
+          const newContent = unwrapMessage(editedPayload);
+          const newText = extractPreviewText(newContent) || '[No text / media message]';
+          const count = (senderEditCounts.get(cached.sender) || 0) + 1;
+          senderEditCounts.set(cached.sender, count);
+          const note = [
+            '✏️ *Message edited*',
+            `📍 ${chatLabel}`,
+            `👤 Sender: ${name} (${cached.sender.split('@')[0]}${cached.sender.endsWith('@lid') ? ' • LID' : ''})`,
+            `🔁 Edited messages from this sender (this session): ${count}`,
+            `🕰️ Before: ${cached.text || '[No text / media message]'}`,
+            `🆕 After: ${String(newText).slice(0, 2000)}`,
+          ].join('\n');
+          cached.text = String(newText).slice(0, 2000); // keep cache current for a later delete/edit report
+          await sock.sendMessage(owner, { text: note }).catch(err => logger.warn({ err, accountId: id }, 'Anti-edit owner notice failed'));
+          if (supabase) {
+            try { await supabase.from(process.env.SUPABASE_AUDIT_TABLE || 'bot_audit_events').insert({ account_id: id, event_type: 'message_edited', chat_jid: cached.chat, sender_jid: cached.sender, message_type: cached.type || 'message', message_text: String(newText).slice(0, 2000), created_at: new Date().toISOString() }); }
+            catch (err) { logger.warn({ err: err.message }, 'Supabase audit insert failed; ensure table/schema exists'); }
+          }
+        }
+      }
+    });
+    sock.ev.on('group-participants.update', async event => {
+      if ((!settings.welcome && !settings.goodbye) || !event.id) return;
+      const meta = await sock.groupMetadata(event.id).catch(() => null);
+      if (!meta) return;
+      for (const jid of event.participants || []) {
+        if (event.action === 'add') await sock.sendMessage(event.id, { text: `👋 Welcome @${jid.split('@')[0]} to *${meta.subject}*!`, mentions: [jid] }).catch(() => {});
+        if (event.action === 'remove' && settings.goodbye) await sock.sendMessage(event.id, { text: `👋 @${jid.split('@')[0]} left the group.`, mentions: [jid] }).catch(() => {});
+      }
+    });
+  } catch (err) {
+    sockets.delete(id);
+    logger.error({ err, accountId: id }, 'Could not start account');
+    const attempts = (reconnectAttempts.get(id) || 0) + 1;
+    reconnectAttempts.set(id, attempts);
+    const delay = Math.min(60000, 3000 * (2 ** Math.min(attempts - 1, 4)));
+    clearTimeout(reconnectTimers.get(id));
+    reconnectTimers.set(id, setTimeout(() => connectAccount(account), delay));
+  }
 }
 
-/*
- * Process-level error handling.
- */
-process.on('uncaughtException', error => {
-  if (
-    error?.code === 'ENOSPC' ||
-    error?.errno === -28 ||
-    error?.message?.includes('no space left on device')
-  ) {
-    console.error(
-      'ENOSPC: No space left on device. Attempting cleanup...'
-    );
-
+const app = express();
+app.get('/', (_req, res) => res.status(200).json({ name: 'DANUWA-MD', status: 'running', connectedAccounts: [...sockets.keys()], mode: settings.mode }));
+app.get('/health', (_req, res) => res.status(200).json({ status: 'ok', connected: sockets.size, configured: configuredAccounts?.length || 0 }));
+const server = app.listen(PORT, '0.0.0.0', () => logger.info(`Health server listening on ${PORT}`));
+let configuredAccounts;
+try {
+  configuredAccounts = readAccounts();
+  logger.info({ accounts: configuredAccounts.map(a => a.id) }, 'Configured WhatsApp accounts');
+  for (const account of configuredAccounts) connectAccount(account);
+} catch (err) {
+  logger.error({ err }, 'Invalid account configuration');
+  server.close(() => process.exit(1));
+}
+async function shutdown(signal) {
+  logger.info({ signal }, 'Shutting down');
+  for (const timer of reconnectTimers.values()) clearTimeout(timer);
+  for (const sock of sockets.values()) { try { sock.end(undefined); } catch {} }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 8000).unref();
+}
+// Heartbeat + watchdog: log health every 5 min; if the socket is silently dead (queries time out twice) or
+// the account stays disconnected for 6+ min, exit so Railway restarts the container (session stays on the volume).
+let downSince = 0;
+setInterval(async () => {
+  const ids = new Set([...sockets.keys(), ...reconnectTimers.keys()]);
+  for (const id of ids) {
+    const sock = sockets.get(id);
+    if (!sock) { downSince = downSince || Date.now(); if (Date.now() - downSince > 6 * 60000) { console.error('[WATCHDOG] disconnected > 6 min, restarting'); process.exit(1); } continue; }
+    downSince = 0;
     try {
-      const { cleanupOldFiles } =
-        require('./utils/cleanup');
-
-      cleanupOldFiles();
-
-      console.warn(
-        'Cleanup attempted. Check available disk space if errors continue.'
-      );
-    } catch (cleanupError) {
-      console.error(
-        'Disk cleanup failed:',
-        cleanupError?.message || cleanupError
-      );
+      const num = String(sock.user?.id || '').split(':')[0].split('@')[0];
+      await Promise.race([sock.onWhatsApp(num), new Promise((_, rej) => setTimeout(() => rej(new Error('ping timeout')), 45000))]);
+      stats.pingFails = 0;
+    } catch (err) {
+      stats.pingFails++;
+      console.error(`[WATCHDOG] ping failed (${stats.pingFails}): ${err.message}`);
+      if (stats.pingFails >= 2) { console.error('[WATCHDOG] connection looks dead, restarting'); process.exit(1); }
     }
-
-    return;
+    const last = stats.lastMsgAt ? `${Math.round((Date.now() - stats.lastMsgAt) / 60000)} min ago` : 'never';
+    console.log(`[HEARTBEAT] ${id}: connected, messages received=${stats.msgs}, last message=${last}, hidden signal-noise=${stats.noise}`);
   }
+}, 5 * 60000).unref();
 
-  console.error(
-    'Uncaught Exception:',
-    error
-  );
-});
-
-process.on('unhandledRejection', error => {
-  if (
-    error?.code === 'ENOSPC' ||
-    error?.errno === -28 ||
-    error?.message?.includes('no space left on device')
-  ) {
-    console.warn(
-      'ENOSPC in promise: attempting cleanup...'
-    );
-
-    try {
-      const { cleanupOldFiles } =
-        require('./utils/cleanup');
-
-      cleanupOldFiles();
-    } catch (cleanupError) {
-      console.error(
-        'Cleanup failed:',
-        cleanupError?.message || cleanupError
-      );
-    }
-
-    return;
-  }
-
-  if (
-    error?.message?.includes('rate-overlimit')
-  ) {
-    console.warn(
-      'Rate limit reached. Slow down requests.'
-    );
-
-    return;
-  }
-
-  console.error(
-    'Unhandled Rejection:',
-    error
-  );
-});
-
-/*
- * Export the store for command modules.
- */
-module.exports = {
-  store,
-  startBot,
-  cleanupPuppeteerCache
-};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
